@@ -5,20 +5,21 @@ Invariants:
 - isolation: a conversation sees exactly the shared datasets and its own ones (its own win on name clashes), never
   the datasets of another conversation;
 - freshness: querying the datasets of a conversation returns the content of the latest successful upload of each
-  visible dataset, also when a dataset is uploaded again with the same name, size and timestamp;
-- atomicity: a failed upload or removal (disk errors, invalid files) leaves the visible datasets unchanged;
+  visible dataset, whatever the clocks of the instances;
+- atomicity: a failed upload (storage errors, invalid files, uploads interrupted in the middle of the write) or a failed
+  removal leaves the visible datasets unchanged;
 - expiration: the cleanup never removes the shared datasets, the datasets of the conversation running it, nor those
   of a conversation that uploaded or used its datasets within the TTL;
-- snapshot: a request that opened the datasets keeps reading the same content until it ends, whatever is uploaded
-  or removed meanwhile;
+- snapshot: a request keeps reading the content it started with until it ends, whatever is uploaded, removed or
+  expired meanwhile on any instance;
 - read-only: the queries of the agent can neither modify the datasets nor open other files (ATTACH);
-- replies: the reply contains every chart drawn by the agent, the answer of the agent survives a failure of the final
-  LLM call, and the history never contains base64 images;
+- local disk: with a remote file manager, nothing is written on the local disk of the instance;
+- replies: the reply contains every chart drawn by the agent (inline), the answer of the agent survives a failure of
+  the final LLM call, and the history never contains base64 images;
 - numbers: the numbers of a CSV file separated by ";" are read back unchanged, in European or in the usual format.
 """
 import contextlib
 import os
-import shutil
 import tempfile
 import time
 import unittest
@@ -75,39 +76,69 @@ def build_datasets_machine():
         def __init__(self):
             super().__init__()
             self.agent = f"agent-{time.monotonic_ns()}"
+            self.fm = m.fakes.ObjectStoreFileManager()
             self.model = {scope: {} for scope in SCOPES}  # scope -> {name: rows}
-            self.snapshots = []  # (engine, expected content) of the requests still open
+            self.snapshots = []  # (engine, expected content) of the requests still running
             self.recent = set()  # conversations that uploaded or used their datasets since time last passed
+            self.interrupted = set()  # (scope, name) with the copy of an interrupted upload
+            self.clock = m.fakes.FakeClock()
+            self.patches = [mock.patch.object(m.datasets, "time", self.clock),
+                            mock.patch.object(m.query_agent, "time", self.clock)]
+            for patch in self.patches:
+                patch.start()
 
         def store(self, scope):
-            return m.datasets.DatasetStore(self.agent, None if scope == "shared" else scope)
+            return m.datasets.DatasetStore(self.fm, self.agent, None if scope == "shared" else scope)
 
         def visible(self, chat):
             return {**self.model["shared"], **self.model[chat]}
 
+        def workspace_engine(self, chat):
+            cat = m.fakes.make_cat(agent_key=self.agent, chat_id=chat, file_manager=self.fm)
+            return m.query_agent.QueryCatAgent(cat)._uploaded_datasets_engine()
+
         # ------------------------------------------------------------------------------------------------------------
         @rule(scope=st.sampled_from(SCOPES), name=st.sampled_from(NAMES), rows=rows_strategy,
-              same_timestamp=st.booleans())
-        def upload(self, scope, name, rows, same_timestamp):
-            store = self.store(scope)
-            folder = store._scope_dir(scope == "shared") / "files"
-            previous = [p.stat() for p in folder.glob(f"*--{name}")] if folder.is_dir() else []
-            store.add(name, content_of(name, rows), shared=scope == "shared")
-            if same_timestamp and previous:
-                # the new copy gets the timestamp of the previous one (coarse clocks, fast clients)
-                current, = folder.glob(f"*--{name}")
-                os.utime(current, ns=(previous[0].st_atime_ns, previous[0].st_mtime_ns))
+              skew=st.sampled_from([0, -3600, 3600]))
+        def upload(self, scope, name, rows, skew):
+            # the upload may be received by an instance whose clock is late or ahead
+            self.clock.offset += skew
+            try:
+                self.store(scope).add(name, content_of(name, rows), shared=scope == "shared")
+            finally:
+                self.clock.offset -= skew
             self.model[scope][name] = rows
             self.recent.add(scope)
+            self.interrupted.discard((scope, name))  # the previous copies are removed
 
         @rule(scope=st.sampled_from(SCOPES), name=st.sampled_from(NAMES), rows=rows_strategy,
-              fault=st.sampled_from(["write", "replace", "validation", "empty", "wrong-kind"]))
+              fault=st.sampled_from(["write-error", "write-refused", "validation", "empty", "wrong-kind", "interrupted"]))
         def failed_upload(self, scope, name, rows, fault):
             store = self.store(scope)
             content = content_of(name, rows)
+            folder = store._scope_dir(scope == "shared")
+            if fault == "interrupted":
+                # the instance died in the middle of the write (after recording the activity, as the store does): a
+                # partial copy with a valid name, never visible
+                real_write = self.fm.write_file
+
+                def die_while_writing(data, stored, where):
+                    if "--" in stored:
+                        real_write(data[:-1], stored, where)
+                        raise SystemExit("the instance died")
+                    return real_write(data, stored, where)
+
+                with mock.patch.object(self.fm, "write_file", die_while_writing):
+                    try:
+                        store.add(name, content, shared=scope == "shared")
+                    except SystemExit:
+                        pass
+                self.interrupted.add((scope, name))
+                self.recent.add(scope)
+                return
             patches = {
-                "write": mock.patch.object(m.datasets.Path, "write_bytes", side_effect=OSError("disk full")),
-                "replace": mock.patch.object(m.datasets.Path, "replace", side_effect=OSError("disk full")),
+                "write-error": mock.patch.object(self.fm, "_write_file", side_effect=OSError("storage down")),
+                "write-refused": mock.patch.object(self.fm, "write_file", return_value=False),
                 "validation": mock.patch.object(m.datasets, "sqlite_tables" if name.endswith(".sqlite") else "read_csv",
                                                 side_effect=m.datasets.DatasetError("invalid")),
             }
@@ -119,7 +150,7 @@ def build_datasets_machine():
             with patches.get(fault, contextlib.nullcontext()):
                 try:
                     store.add(name, content, shared=scope == "shared")
-                except (OSError, m.datasets.DatasetError):
+                except m.datasets.DatasetError:
                     pass
                 else:  # pragma: no cover - every fault makes the upload fail
                     raise AssertionError(f"the upload should have failed ({fault})")
@@ -128,27 +159,25 @@ def build_datasets_machine():
         def remove(self, scope, name, fault):
             store = self.store(scope)
             if fault:
-                with mock.patch.object(m.datasets.Path, "unlink", side_effect=OSError("busy")):
+                with mock.patch.object(self.fm, "_remove_file", side_effect=OSError("storage down")):
                     try:
                         store.remove(name, shared=scope == "shared")
                     except OSError:
                         pass
                 return
             removed = store.remove(name, shared=scope == "shared")
-            assert removed == (name in self.model[scope])
+            assert removed == (name in self.model[scope] or (scope, name) in self.interrupted)
             self.model[scope].pop(name, None)
+            self.interrupted.discard((scope, name))
 
         @rule(chat=st.sampled_from(("c1", "c2")))
         def open_request(self, chat):
             visible = self.visible(chat)
-            # the path of a request of the query agent
-            agent = m.query_agent.QueryCatAgent(m.fakes.make_cat(agent_key=self.agent, chat_id=chat))
-            engine = agent._uploaded_datasets_engine()
+            engine = self.workspace_engine(chat)
             if not visible:
                 assert engine is None
                 return
-            if self.model[chat] or m.datasets.DatasetStore(self.agent, chat).chat_dir.is_dir():
-                self.recent.add(chat)
+            self.recent.add(chat)
             self.snapshots.append((engine, visible))
             assert read_all(engine, visible) == visible
 
@@ -161,35 +190,23 @@ def build_datasets_machine():
 
         @rule()
         def time_passes(self):
-            past = time.time() - 10 * 3600
-            for path in m.datasets.DatasetStore(self.agent).agent_dir.rglob("*"):
-                os.utime(path, (past, past))
+            self.clock.offset += 10 * 3600
             self.recent.clear()
 
         @rule(scope=st.sampled_from(SCOPES))
         def cleanup(self, scope):
-            store = self.store(scope)
-            store.cleanup_expired(5)
+            self.store(scope).cleanup_expired(5)
             for chat in ("c1", "c2"):
                 if chat in self.recent or chat == scope:
                     continue  # protected: the isolation invariant checks that nothing was removed
-                if not m.datasets.DatasetStore(self.agent, chat).chat_dir.is_dir():
-                    self.model[chat] = {}
-
-        @rule(chat=st.sampled_from(("c1", "c2")))
-        def failed_workspace_build(self, chat):
-            store = m.datasets.DatasetStore(self.agent, chat)
-            with mock.patch.object(m.datasets, "read_csv", side_effect=m.datasets.DatasetError("broken")):
-                try:
-                    store.workspace_path()
-                except m.datasets.DatasetError:
-                    pass
+                self.model[chat] = {}
+                self.interrupted = {(s, n) for s, n in self.interrupted if s != chat}
 
         # ------------------------------------------------------------------------------------------------------------
         @invariant()
         def isolation(self):
             for chat in ("c1", "c2"):
-                listed = {d.name: d.scope for d in m.datasets.DatasetStore(self.agent, chat).list_datasets()}
+                listed = {d.name: d.scope for d in m.datasets.DatasetStore(self.fm, self.agent, chat).list_datasets()}
                 expected = {name: "shared" for name in self.model["shared"]}
                 expected.update({name: "chat" for name in self.model[chat]})
                 assert listed == expected, (chat, listed, expected)
@@ -198,24 +215,31 @@ def build_datasets_machine():
         def freshness_and_read_only(self):
             for chat in ("c1", "c2"):
                 visible = self.visible(chat)
-                path = m.datasets.DatasetStore(self.agent, chat).workspace_path()
+                store = m.datasets.DatasetStore(self.fm, self.agent, chat)
+                workspace = store.workspace()
                 if not visible:
-                    assert path is None
+                    assert workspace is None
                     continue
-                engine = m.data_engine.engine_from_sqlite_file(path)
+                engine = m.data_engine.engine_from_bytes(workspace)
                 try:
                     assert read_all(engine, visible) == visible
                     db = m.data_engine.sql_database(engine, cache=False)
                     name = next(iter(visible))
                     assert "Error" in db.run_no_throw(f"DELETE FROM {table_of(name)}")
-                    assert "Error" in db.run_no_throw(f"ATTACH DATABASE '{path}' AS other")
+                    assert "Error" in db.run_no_throw("ATTACH DATABASE ':memory:' AS other")
                 finally:
                     engine.dispose()
+
+        @invariant()
+        def requests_keep_their_snapshot(self):
+            for engine, expected in self.snapshots:
+                assert read_all(engine, expected) == expected
 
         def teardown(self):
             for engine, _ in self.snapshots:
                 engine.dispose()
-            shutil.rmtree(m.datasets.DatasetStore(self.agent).agent_dir, ignore_errors=True)
+            for patch in self.patches:
+                patch.stop()
 
     DatasetsMachine.TestCase.settings = settings(
         max_examples=int(os.environ.get("CWYD_EXAMPLES", "60")), stateful_step_count=25, deadline=None, database=None,
@@ -238,8 +262,8 @@ def build_replies_machine():
 
         @rule(charts=st.integers(0, 4), answer=st.sampled_from(["", "N leads", "braces {x}"]),
               final=st.sampled_from(["ok", "empty", "llm-error", "exception"]),
-              delivery=st.sampled_from(["inline", "url"]), react=st.booleans())
-        def ask(self, charts, answer, final, delivery, react):
+              react=st.booleans())
+        def ask(self, charts, answer, final, react):
             chart = {"sql": "SELECT region, amount FROM sales", "chart_type": "bar", "x": "region", "y": ["amount"]}
             if react:
                 script = [f.react_step("draw_chart", {**chart, "title": f"C{i}"}) for i in range(charts)]
@@ -254,7 +278,7 @@ def build_replies_machine():
                 "ok": f.Workflow(output="final text"), "empty": f.Workflow(output=""),
                 "llm-error": f.Workflow(output="x", with_llm_error=True), "exception": f.Workflow(error=RuntimeError("down")),
             }[final]
-            settings_ = support.default_settings(ds_type="CSV", host=str(self.csv), chart_delivery=delivery)
+            settings_ = support.default_settings(ds_type="CSV", host=str(self.csv))
             cat = f.make_cat(llm, settings_, workflow=workflow, history=self.history, agent_key="agent-replies")
             output = support.run(m.query_cat.agent_fast_reply.function(cat))
             self.history = cat.working_memory.history
@@ -264,13 +288,12 @@ def build_replies_machine():
                 assert output is None
                 return
             text = output.output
-            marker = "data:image/png;base64," if delivery == "inline" else "/custom/cat-with-your-data/charts/"
-            assert text.count(marker) == drawn, (text[:200], drawn)
+            assert text.count("data:image/png;base64,") == drawn, (text[:200], drawn)
             expected_text = "final text" if final == "ok" else answer
             assert text.startswith(expected_text) if expected_text else text.startswith("![")
             saved = self.history[-1].content.text
             assert "base64," not in saved
-            assert saved.count("[chart: ") == (drawn if delivery == "inline" else 0)
+            assert saved.count("[chart: ") == drawn
 
         @invariant()
         def history_has_no_images(self):

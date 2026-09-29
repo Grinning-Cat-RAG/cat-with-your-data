@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-import sqlite3
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 from langchain_classic.agents import AgentType
 from langchain_community.agent_toolkits import SQLDatabaseToolkit, create_sql_agent, JsonToolkit, create_json_agent
+from langchain_community.tools.sql_database.tool import QuerySQLDatabaseTool
 from langchain_community.tools.json.tool import JsonSpec
 from langchain_community.agent_toolkits.sql.prompt import SQL_PREFIX
 from langchain_core.language_models import BaseChatModel
@@ -19,8 +20,10 @@ from cat.log import log
 from cat.templates import prompts
 
 from .chart_tool import WHEN_TO_USE, ChartCollector, ChartToolFactory
-from .charts import chart_markdown_inline, chart_markdown_url, save_chart, strip_inline_images
-from .data_engine import engine_from_csv, engine_from_json, engine_from_sqlite_file, engine_from_uri, sql_database
+from .charts import chart_markdown_inline, strip_inline_images
+from .data_engine import (
+    engine_from_bytes, engine_from_csv, engine_from_json, engine_from_uri, sql_database, validate_read_only,
+)
 # the core loader imports and then reloads the plugin modules one by one, in no particular order: the classes of
 # `datasets` are looked up at call time, so that `except` and patches always see the current ones
 from . import datasets
@@ -60,6 +63,26 @@ def _escape_braces(text: str) -> str:
 
 def _mask_password(connection_string: str) -> str:
     return re.sub(r"://([^:/@]*):[^@]*@", r"://\1:***@", connection_string)
+
+
+class ReadOnlyQuerySQLDatabaseTool(QuerySQLDatabaseTool):
+    """The ``sql_db_query`` tool of the SQL agent, accepting only a single read-only SELECT statement."""
+
+    def _run(self, query: str, run_manager=None) -> str:
+        try:
+            query = validate_read_only(query)
+        except ValueError as e:
+            return f"Error: {e} Write a single read-only SELECT statement."
+        return super()._run(query, run_manager)
+
+
+class ReadOnlySQLDatabaseToolkit(SQLDatabaseToolkit):
+    def get_tools(self):
+        return [
+            ReadOnlyQuerySQLDatabaseTool(db=tool.db, description=tool.description)
+            if isinstance(tool, QuerySQLDatabaseTool) else tool
+            for tool in super().get_tools()
+        ]
 
 
 class QueryCatAgent:
@@ -119,20 +142,22 @@ class QueryCatAgent:
     # datasource
     # ----------------------------------------------------------------------------------------------------------------
     def _uploaded_datasets_engine(self) -> Engine | None:
-        store = datasets.DatasetStore(self.cat.agent_key, self.cat.id)
+        store = datasets.DatasetStore(self.cat.file_manager, self.cat.agent_key, self.cat.id)
         failures = 0
         while True:
-            if (path := store.workspace_path()) is None:
-                return None
             try:
-                engine = engine_from_sqlite_file(path)
+                if (workspace := store.workspace()) is None:
+                    return None
+                engine = engine_from_bytes(workspace)
                 store.mark_used()
                 return engine
-            except sqlite3.OperationalError:
-                # the file was replaced by a concurrent upload between the two calls: look for the current one
+            except FileNotFoundError:
+                # a dataset was removed or replaced (on any instance) while it was being downloaded, or it is still
+                # being written: look for the current ones
                 failures += 1
                 if failures == 3:
                     raise
+                time.sleep(0.2 * failures)
 
     async def _resolve_datasource(self) -> DataSource | None:
         # datasets uploaded on the fly (chat and agent level) win over the configured datasource
@@ -198,7 +223,7 @@ class QueryCatAgent:
             if source.per_request:
                 source.engine.dispose()
 
-        chart_markdown = "\n\n".join([await self._chart_markdown(c.png, c.spec.title) for c in collector.charts])
+        chart_markdown = "\n\n".join(chart_markdown_inline(c.png, c.spec.title) for c in collector.charts)
         if not answer and not chart_markdown:
             return None
 
@@ -215,25 +240,6 @@ class QueryCatAgent:
     async def get_reasoning_agent(self) -> str | None:
         result = await self.run()
         return result.thought if result else None
-
-    # ----------------------------------------------------------------------------------------------------------------
-    # charts
-    # ----------------------------------------------------------------------------------------------------------------
-    def _store_chart(self, png: bytes) -> str:
-        chart_id = save_chart(self.cat.agent_key, png)
-        # the expired charts are removed here too: with a configured datasource there may be no uploads at all
-        store = datasets.DatasetStore(self.cat.agent_key, self.cat.id)
-        store.cleanup_expired(float(self._setting("chat_datasets_ttl_hours", 0)))
-        return chart_id
-
-    async def _chart_markdown(self, png: bytes, title: str) -> str:
-        if self._setting("chart_delivery", "inline") == "url":
-            try:
-                chart_id = await asyncio.to_thread(self._store_chart, png)
-                return chart_markdown_url(self._setting("public_base_url", ""), self.cat.agent_key, chart_id, title)
-            except OSError as e:
-                log.error(f"[cat-with-your-data] cannot store the chart, falling back to inline delivery: {e}")
-        return chart_markdown_inline(png, title)
 
     # ----------------------------------------------------------------------------------------------------------------
     # final answer
@@ -358,7 +364,7 @@ reply to the user briefly, precisely and based on the context of the dialogue.
             # Create SQL Agent
             agent_executor = create_sql_agent(
                 llm=self.large_language_model,
-                toolkit=SQLDatabaseToolkit(db=db, llm=self.large_language_model),
+                toolkit=ReadOnlySQLDatabaseToolkit(db=db, llm=self.large_language_model),
                 verbose=True,
                 agent_type=agent_type,
                 prefix=prefix,

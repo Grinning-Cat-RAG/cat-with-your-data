@@ -12,10 +12,12 @@ from typing import Callable, Dict, Tuple
 import pandas as pd
 from langchain_community.utilities import SQLDatabase
 from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.pool import NullPool, StaticPool
 
-from .datasets import read_csv, sqlite_connect_ro, table_name_from
+# the core loader reloads the plugin modules in no particular order: the classes of `datasets` are looked up at call time
+from . import datasets
+from .datasets import read_csv, table_name_from
 
 _MAX_CACHED_ENGINES = 16
 # cache key -> (engine, function releasing the resources of the engine)
@@ -52,13 +54,12 @@ def _cached(key: str, factory: Callable[[], Tuple[Engine, Callable[[], None]]]) 
     return _get_cached(key) or _put_cached(key, *factory())
 
 
-def _harden_sqlite(engine: Engine, query_only: bool) -> Engine:
-    """No ATTACH on the plugin's SQLite connections (it would open any file of the host) and, if required, no writes."""
+def _harden_sqlite(engine: Engine) -> Engine:
+    """No ATTACH on the plugin's SQLite connections (it would open any file of the host) and no writes."""
     @event.listens_for(engine, "connect")
     def _on_connect(dbapi_connection, _connection_record):
         dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
-        if query_only:
-            dbapi_connection.execute("PRAGMA query_only = ON")
+        dbapi_connection.execute("PRAGMA query_only = ON")
 
     return engine
 
@@ -86,32 +87,47 @@ def sql_database(engine: Engine, cache: bool = True) -> SQLDatabase:
     return db
 
 
+def _mysql_read_only(dbapi_connection, _connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET SESSION TRANSACTION READ ONLY")
+    finally:
+        cursor.close()
+
+
 def engine_from_uri(uri: str) -> Engine:
-    """Engine for a SQLAlchemy URL (configured SQL datasources); engines are cached to reuse the pools."""
+    """Engine for a SQLAlchemy URL (configured SQL datasources); engines are cached to reuse the pools.
+
+    The sessions are read-only where the database allows it (PostgreSQL, MySQL, SQLite); the agent cannot change it,
+    since only SELECT statements are accepted. For the other databases, use a user with read-only privileges.
+    """
     def factory():
-        engine = create_engine(uri, pool_pre_ping=True)
-        if engine.dialect.name == "sqlite":
-            _harden_sqlite(engine, query_only=False)
+        backend = make_url(uri).get_backend_name()
+        kwargs = {"connect_args": {"options": "-c default_transaction_read_only=on"}} if backend == "postgresql" else {}
+        engine = create_engine(uri, pool_pre_ping=True, **kwargs)
+        if backend == "mysql":
+            event.listen(engine, "connect", _mysql_read_only)
+        if backend == "sqlite":
+            _harden_sqlite(engine)
         return engine, engine.dispose
 
     return _cached(f"uri::{uri}", factory)
 
 
-def engine_from_sqlite_file(path: Path) -> Engine:
-    """Read-only engine on a SQLite file (uploaded datasets), for a single request: dispose it at the end.
+def engine_from_bytes(content: bytes) -> Engine:
+    """Read-only engine on an in-memory SQLite database (uploaded datasets), for a single request: dispose it at the end.
 
-    The file is opened (and read) here, and the request uses only this connection: the open file stays readable until
-    the request ends, even if a new upload or a new workspace removes it meanwhile. The agent runs its tools one at a
-    time, so the connection is never used concurrently.
+    The request uses only this connection (the agent runs its tools one at a time, so it is never used concurrently).
     """
-    connection = sqlite_connect_ro(path, check_same_thread=False)
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
     try:
+        connection.deserialize(content)
         connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
-    except sqlite3.Error:
+    except sqlite3.DatabaseError as e:
         connection.close()
-        raise
+        raise datasets.DatasetError(f"Invalid SQLite database: {e}") from e
     engine = create_engine("sqlite://", creator=lambda: connection, poolclass=StaticPool)
-    return _harden_sqlite(engine, query_only=True)
+    return _harden_sqlite(engine)
 
 
 def _memory_engine(frames: Dict[str, pd.DataFrame]) -> Tuple[Engine, Callable[[], None]]:
@@ -136,7 +152,6 @@ def _memory_engine(frames: Dict[str, pd.DataFrame]) -> Tuple[Engine, Callable[[]
             creator=lambda: sqlite3.connect(uri, uri=True, check_same_thread=False),
             poolclass=NullPool,
         ),
-        query_only=True,
     )
 
     def release():

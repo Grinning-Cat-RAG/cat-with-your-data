@@ -1,12 +1,9 @@
-"""Chart rendering (matplotlib, headless) and storage of the generated images."""
+"""Chart rendering (matplotlib, headless) and delivery of the generated images, inline in the answer."""
 import base64
 import io
 import re
 import textwrap
-import uuid
-from pathlib import Path
 from typing import List, Literal
-from urllib.parse import quote
 
 import matplotlib
 
@@ -17,13 +14,10 @@ from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 from pydantic import BaseModel, Field, field_validator  # noqa: E402
 
-from . import datasets  # noqa: E402 - see query_agent.py: classes looked up at call time
-
 ChartType = Literal["bar", "barh", "line", "area", "pie", "scatter", "hist"]
 
 MAX_CATEGORIES = 40
 MAX_PIE_SLICES = 10
-_CHART_ID = re.compile(r"^[a-f0-9]{32}$")
 
 
 class ChartSpec(BaseModel):
@@ -254,36 +248,11 @@ def render_chart(df: pd.DataFrame, spec: ChartSpec) -> bytes:
 
 
 # --------------------------------------------------------------------------------------------------------------------
-# storage and delivery
+# delivery
 # --------------------------------------------------------------------------------------------------------------------
-def _charts_dir(agent_key: str) -> Path:
-    return datasets.DatasetStore(agent_key).agent_dir / datasets.CHARTS_SCOPE
-
-
-def save_chart(agent_key: str, png: bytes) -> str:
-    folder = _charts_dir(agent_key)
-    folder.mkdir(parents=True, exist_ok=True)
-    chart_id = uuid.uuid4().hex
-    (folder / f"{chart_id}.png").write_bytes(png)
-    return chart_id
-
-
-def load_chart(agent_key: str, chart_id: str) -> bytes | None:
-    if not _CHART_ID.match(chart_id or ""):
-        return None
-    path = _charts_dir(agent_key) / f"{chart_id}.png"
-    return path.read_bytes() if path.is_file() else None
-
-
 def chart_markdown_inline(png: bytes, title: str) -> str:
     alt = re.sub(r"[\[\]\n]", " ", title or "chart").strip()
     return f"![{alt}](data:image/png;base64,{base64.b64encode(png).decode('ascii')})"
-
-
-def chart_markdown_url(base_url: str, agent_key: str, chart_id: str, title: str) -> str:
-    alt = re.sub(r"[\[\]\n]", " ", title or "chart").strip()
-    base = (base_url or "").rstrip("/")
-    return f"![{alt}]({base}/custom/cat-with-your-data/charts/{quote(agent_key, safe='')}/{chart_id}.png)"
 
 
 _DATA_URI_IMAGE = re.compile(r"!\[([^\]]*)\]\(data:image/[a-z]+;base64,[A-Za-z0-9+/=]+\)")

@@ -1,6 +1,5 @@
 """The query agent, run with scripted LLMs (ReAct and tool calling) on every kind of datasource."""
 import json
-import os
 import tempfile
 import time
 import unittest
@@ -22,6 +21,9 @@ def setUpModule():
 
 
 class AgentTestCase(unittest.TestCase):
+    def store(self, chat="chat-1"):
+        return m.datasets.DatasetStore(m.file_manager, self.agent_key, chat)
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.csv = self.tmp / "sales.csv"
@@ -78,7 +80,7 @@ class DatasourceTest(AgentTestCase):
         self.run_agent(self.cat(llm, settings))
         self.assertIn("conf", str(llm.prompts[-1][-1].content))
 
-        m.datasets.DatasetStore(self.agent_key, "chat-1").add("up.csv", b"x\n1\n")
+        self.store().add("up.csv", b"x\n1\n")
         llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_list_tables", {"tool_input": ""}), f.AIMessage(content="b")])
         self.run_agent(self.cat(llm, settings))
         self.assertEqual(llm.prompts[-1][-1].content, "up")  # the uploaded datasets win
@@ -90,34 +92,35 @@ class DatasourceTest(AgentTestCase):
 
     def test_uploaded_datasets_without_configured_datasource(self):
         self.assertIsNone(self.run_agent(self.cat(f.ScriptedChatModel(script=[]), support.default_settings())))
-        m.datasets.DatasetStore(self.agent_key, "chat-1").add("up.sqlite", support.sqlite_bytes({"t": (["v"], [(1,)])}))
+        self.store().add("up.sqlite", support.sqlite_bytes({"t": (["v"], [(1,)])}))
         llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "SELECT v FROM t"}), f.AIMessage(content="one")])
         self.assertEqual(self.run_agent(self.cat(llm, support.default_settings())).answer, "one")
 
-    def test_uploaded_dataset_replaced_while_opening(self):
-        import sqlite3
-        m.datasets.DatasetStore(self.agent_key, "chat-1").add("up.sqlite", support.sqlite_bytes({"t": (["v"], [(1,)])}))
-        real, calls = m.query_agent.engine_from_sqlite_file, []
+    def test_uploaded_dataset_replaced_while_reading(self):
+        self.store().add("up.sqlite", support.sqlite_bytes({"t": (["v"], [(1,)])}))
+        real, calls = m.datasets.DatasetStore.workspace, []
 
-        def flaky(path):
-            calls.append(path)
+        def flaky(store):
+            calls.append(True)
             if len(calls) < 3:
-                raise sqlite3.OperationalError("unable to open database file")
-            return real(path)
+                raise FileNotFoundError("replaced on another instance")
+            return real(store)
 
-        with mock.patch.object(m.query_agent, "engine_from_sqlite_file", side_effect=flaky):
+        with mock.patch.object(m.datasets.DatasetStore, "workspace", flaky), \
+                mock.patch.object(m.query_agent, "time", m.fakes.FakeClock()):
             llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "SELECT v FROM t"}), f.AIMessage(content="one")])
             self.assertEqual(self.run_agent(self.cat(llm)).answer, "one")
         self.assertEqual(len(calls), 3)
         # always failing: the configured datasource is used
-        with mock.patch.object(m.query_agent, "engine_from_sqlite_file", side_effect=sqlite3.OperationalError("gone")):
+        with mock.patch.object(m.datasets.DatasetStore, "workspace", side_effect=FileNotFoundError("gone")), \
+                mock.patch.object(m.query_agent, "time", m.fakes.FakeClock()):
             llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_list_tables", {"tool_input": ""}), f.AIMessage(content="csv")])
             self.assertEqual(self.run_agent(self.cat(llm)).answer, "csv")
         self.assertEqual(llm.prompts[-1][-1].content, "sales")
 
     def test_broken_uploaded_datasets_fall_back_to_the_configured_datasource(self):
-        m.datasets.DatasetStore(self.agent_key, "chat-1").add("up.csv", b"x\n1\n")
-        with mock.patch.object(m.datasets.DatasetStore, "workspace_path", side_effect=OSError("disk")):
+        self.store().add("up.csv", b"x\n1\n")
+        with mock.patch.object(m.datasets.DatasetStore, "workspace", side_effect=OSError("storage down")):
             llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_list_tables", {"tool_input": ""}), f.AIMessage(content="ok")])
             self.assertEqual(self.run_agent(self.cat(llm)).answer, "ok")
         self.assertEqual(llm.prompts[-1][-1].content, "sales")  # the configured CSV, not the uploaded dataset
@@ -197,58 +200,28 @@ class DatasourceTest(AgentTestCase):
         self.assertIsNone(support.run(m.query_agent.QueryCatAgent(self.cat(llm, support.default_settings())).get_reasoning_agent()))
 
 
-class ChartDeliveryTest(AgentTestCase):
-    def chart_llm(self):
-        return f.ScriptedChatModel(script=[f.tool_call("draw_chart", CHART), f.AIMessage(content="")])
-
-    def test_url_delivery_and_cleanup(self):
-        # regression: with a configured datasource (no uploads) the URL charts were never removed
-        charts_dir = m.datasets.DatasetStore(self.agent_key).agent_dir / m.datasets.CHARTS_SCOPE
-        charts_dir.mkdir(parents=True)
-        old = charts_dir / ("0" * 32 + ".png")
-        old.write_bytes(b"old")
-        past = time.time() - 100 * 3600
-        os.utime(old, (past, past))
-
-        settings = support.default_settings(ds_type="CSV", host=str(self.csv), chart_delivery="url",
-                                            public_base_url="https://cat.example.com")
-        result = self.run_agent(self.cat(self.chart_llm(), settings))
-        self.assertRegex(result.chart_markdown,
-                         rf"^!\[Sales by region\]\(https://cat.example.com/custom/cat-with-your-data/charts/{self.agent_key}/[a-f0-9]{{32}}\.png\)$")
-        self.assertEqual(result.answer, "")
-        self.assertFalse(old.exists())
-        self.assertEqual(len(list(charts_dir.iterdir())), 1)
-
+class UsageTest(AgentTestCase):
     def test_querying_marks_the_datasets_as_used(self):
         # regression: the datasets of a conversation in use were removed once uploaded more than the TTL ago
-        store = m.datasets.DatasetStore(self.agent_key, "chat-1")
-        store.add("up.csv", b"x\n1\n")
-        store.add("up2.csv", b"x\n2\n")
-
-        def ask():
-            llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "SELECT x FROM up"}), f.AIMessage(content="1")])
-            self.assertEqual(self.run_agent(self.cat(llm, support.default_settings())).answer, "1")
-
-        def age():
-            past = time.time() - 100 * 3600
-            for path in store.chat_dir.rglob("*"):
-                os.utime(path, (past, past))
-
-        ask()  # builds the workspace
-        age()
-        ask()  # the same workspace is used again
-        m.datasets.DatasetStore(self.agent_key, "another-chat").cleanup_expired(1)
-        self.assertEqual([d.name for d in store.list_datasets()], ["up.csv", "up2.csv"])
-
-    def test_url_delivery_falls_back_to_inline(self):
-        settings = support.default_settings(ds_type="CSV", host=str(self.csv), chart_delivery="url")
-        with mock.patch.object(m.query_agent, "save_chart", side_effect=OSError("read-only disk")):
-            result = self.run_agent(self.cat(self.chart_llm(), settings))
-        self.assertIn("data:image/png;base64,", result.chart_markdown)
+        with mock.patch.object(m.datasets, "time", m.fakes.FakeClock(-100 * 3600)):
+            self.store().add("up.csv", b"x\n1\n")
+        llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "SELECT x FROM up"}), f.AIMessage(content="1")])
+        self.assertEqual(self.run_agent(self.cat(llm, support.default_settings())).answer, "1")
+        self.store("another-chat").cleanup_expired(1)
+        self.assertEqual([d.name for d in self.store().list_datasets()], ["up.csv"])
 
     def test_nothing_to_say(self):
         llm = f.ScriptedChatModel(script=[f.AIMessage(content="")])
         self.assertIsNone(self.run_agent(self.cat(llm)))
+
+    def test_queries_of_the_agent_are_read_only(self):
+        # the sql_db_query tool accepts only a single SELECT (the sessions are read-only too)
+        llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "DELETE FROM sales"}), f.AIMessage(content="no")])
+        self.run_agent(self.cat(llm))
+        self.assertIn("Error: Only SELECT statements are allowed.", llm.prompts[-1][-1].content)
+        llm = f.ReactChatModel(script=[f.react_step("sql_db_query", "SELECT COUNT(*) FROM sales; DROP TABLE sales"), f.react_final("no")])
+        self.run_agent(self.cat(llm))
+        self.assertIn("Only a single SQL statement is allowed.", str(llm.prompts[-1]))
 
 
 class FinalOutputTest(AgentTestCase):

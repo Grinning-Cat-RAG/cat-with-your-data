@@ -111,21 +111,10 @@ class RenderTest(unittest.TestCase):
 
 
 class DeliveryTest(unittest.TestCase):
-    def test_save_and_load(self):
-        chart_id = m.charts.save_chart("agent-charts", PNG)
-        self.assertEqual(m.charts.load_chart("agent-charts", chart_id), PNG)
-        self.assertIsNone(m.charts.load_chart("agent-charts", "0" * 32))
-        for invalid in ("../../x", "", None, chart_id.upper()):
-            self.assertIsNone(m.charts.load_chart("agent-charts", invalid))
-
     def test_markdown(self):
         inline = m.charts.chart_markdown_inline(PNG, "Sales [2024]\nby region")
         self.assertTrue(inline.startswith("![Sales  2024  by region](data:image/png;base64,"))
         self.assertEqual(base64.b64decode(inline.split(",", 1)[1][:-1]), PNG)
-        self.assertEqual(
-            m.charts.chart_markdown_url("https://cat.example.com/", "my agent", "abc", ""),
-            "![chart](https://cat.example.com/custom/cat-with-your-data/charts/my%20agent/abc.png)",
-        )
         text = f"Answer\n\n{inline}\n\n{inline}"
         self.assertEqual(m.charts.strip_inline_images(text), "Answer\n\n[chart: Sales  2024  by region]\n\n[chart: Sales  2024  by region]")
         self.assertEqual(m.charts.strip_inline_images(None), "")

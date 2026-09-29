@@ -38,16 +38,15 @@ class SqliteHardeningTest(Files):
 
     def test_uploaded_dataset_cannot_attach_other_files(self):
         # regression: the agent could ATTACH (and read) any SQLite file of the host, e.g. other agents' datasets
-        path = support.sqlite_file(self.tmp / "up.sqlite", {"t": (["v"], [(1,)])})
-        self.assert_no_attach(m.data_engine.engine_from_sqlite_file(path))
+        self.assert_no_attach(m.data_engine.engine_from_bytes(support.sqlite_bytes({"t": (["v"], [(1,)])})))
 
-    def test_configured_sqlite_cannot_attach_other_files(self):
+    def test_configured_sqlite_is_read_only(self):
         path = support.sqlite_file(self.tmp / "conf.sqlite", {"t": (["v"], [(1,)])})
         engine = m.data_engine.engine_from_uri(f"sqlite:///{path}")
         self.assert_no_attach(engine)
-        # the configured SQLite datasource is not made read-only
         db = m.data_engine.sql_database(engine, cache=False)
-        self.assertNotIn("Error", db.run_no_throw("CREATE TABLE w (x)"))
+        self.assertIn("Error", db.run_no_throw("CREATE TABLE w (x)"))
+        self.assertEqual(db.run("SELECT v FROM t"), "[(1,)]")
 
     def test_csv_engine_cannot_attach_nor_write(self):
         # regression: DROP TABLE on the cached in-memory engine persisted until the CSV file changed
@@ -59,27 +58,32 @@ class SqliteHardeningTest(Files):
         self.assertEqual(db.run("SELECT COUNT(*) FROM sales"), "[(2,)]")
 
     def test_uploaded_dataset_is_read_only(self):
-        path = support.sqlite_file(self.tmp / "ro.sqlite", {"t": (["v"], [(1,)])})
-        db = m.data_engine.sql_database(m.data_engine.engine_from_sqlite_file(path), cache=False)
+        db = m.data_engine.sql_database(m.data_engine.engine_from_bytes(support.sqlite_bytes({"t": (["v"], [(1,)])})), cache=False)
         self.assertIn("Error", db.run_no_throw("DELETE FROM t"))
         self.assertEqual(db.run("SELECT COUNT(*) FROM t"), "[(1,)]")
 
-    def test_uploaded_dataset_is_read_at_every_request(self):
-        # regression: a SQLite dataset uploaded again with the same name was served by a cached engine on the old file
-        store = m.datasets.DatasetStore(f"agent-{id(self)}", "chat")
-        store.add("x.sqlite", support.sqlite_bytes({"t": (["v"], [(1,)])}))
-        first = m.data_engine.engine_from_sqlite_file(store.workspace_path())
-        self.assertEqual(m.data_engine.sql_database(first, cache=False).run("SELECT COUNT(*) FROM t"), "[(1,)]")
-        store.add("x.sqlite", support.sqlite_bytes({"t": (["v"], [(1,), (2,), (3,)])}))
-        second = m.data_engine.engine_from_sqlite_file(store.workspace_path())
-        self.assertEqual(m.data_engine.sql_database(second, cache=False).run("SELECT COUNT(*) FROM t"), "[(3,)]")
+    def test_invalid_uploaded_database(self):
+        with self.assertRaises(m.datasets.DatasetError):
+            m.data_engine.engine_from_bytes(m.datasets.SQLITE_MAGIC + b"\x00" * 100)
 
-    def test_paths_with_uri_characters(self):
-        folder = self.tmp / "a?b#c%d"
-        folder.mkdir()
-        path = support.sqlite_file(folder / "x.sqlite", {"t": (["v"], [(7,)])})
-        db = m.data_engine.sql_database(m.data_engine.engine_from_sqlite_file(path), cache=False)
-        self.assertEqual(db.run("SELECT v FROM t"), "[(7,)]")
+
+class ReadOnlySessionsTest(Files):
+    def test_postgresql_sessions_are_read_only(self):
+        import psycopg2
+
+        with mock.patch.object(psycopg2, "connect", side_effect=RuntimeError("no server")) as connect:
+            engine = m.data_engine.engine_from_uri(f"postgresql+psycopg2://u:p@localhost:1/ro{id(self)}")
+            with self.assertRaises(Exception):
+                engine.connect()
+        self.assertIn("default_transaction_read_only=on", connect.call_args.kwargs["options"])
+
+    def test_mysql_sessions_are_read_only(self):
+        engine = m.data_engine.engine_from_uri(f"mysql+mysqlconnector://u:p@localhost:1/ro{id(self)}")
+        self.assertTrue(m.data_engine.event.contains(engine, "connect", m.data_engine._mysql_read_only))
+        connection = mock.Mock()
+        m.data_engine._mysql_read_only(connection, None)
+        connection.cursor.return_value.execute.assert_called_once_with("SET SESSION TRANSACTION READ ONLY")
+        connection.cursor.return_value.close.assert_called_once()
 
 
 class ConcurrencyTest(Files):
@@ -150,14 +154,6 @@ class CacheTest(Files):
         # no connection is opened until the first query
         postgres = m.data_engine.engine_from_uri("postgresql+psycopg2://u:p@localhost:1/d")
         self.assertEqual(postgres.dialect.name, "postgresql")
-
-    def test_sqlite_file_engine_on_an_invalid_file(self):
-        path = self.tmp / "garbage.sqlite"
-        path.write_bytes(b"this is not a database" * 100)
-        with self.assertRaises(m.data_engine.sqlite3.DatabaseError):
-            m.data_engine.engine_from_sqlite_file(path)
-        with self.assertRaises(m.data_engine.sqlite3.OperationalError):
-            m.data_engine.engine_from_sqlite_file(self.tmp / "missing.sqlite")
 
     def test_schema_cache(self):
         engine = m.data_engine.engine_from_csv(str(self.csv()))

@@ -8,8 +8,10 @@ needs only the standard library, and everything else is imported lazily by ``loa
 """
 import asyncio
 import json
+import os
 import sqlite3
 import sys
+import time
 import tempfile
 import warnings
 from pathlib import Path
@@ -33,6 +35,7 @@ def load() -> SimpleNamespace:
                  "query_cat", "endpoints"):
         setattr(modules, name, sys.modules[f"{PACKAGE}.{name}"])
     modules.fakes = _build_fakes()
+    modules.file_manager = modules.fakes.ObjectStoreFileManager()
     modules.loaded = True
     return modules
 
@@ -40,9 +43,9 @@ def load() -> SimpleNamespace:
 def load_plugin(order=None):
     """Import (or reload) the plugin with the core loader, as in production; ``order`` sorts the files to load.
 
-    The security scan forbids dynamic imports in the plugin files. The data folder of the core is never touched: the
-    plugin modules bind ``get_data_path`` when loaded, so it is patched only while loading (other tests running in the
-    same process, e.g. the core ones under pytest, are not affected).
+    The security scan forbids dynamic imports in the plugin files. The data folder of the core is never touched: it is
+    patched only while loading (other tests running in the same process, e.g. the core ones under pytest, are not
+    affected).
     """
     from unittest import mock
 
@@ -54,7 +57,6 @@ def load_plugin(order=None):
         plugin._py_files = sorted(plugin._py_files, key=order)
     with mock.patch.object(cat.utils, "get_data_path", lambda: str(modules.data_root)):
         plugin._load_decorated_functions()
-    assert sys.modules[f"{PACKAGE}.datasets"].get_data_path() == str(modules.data_root)
     return plugin
 
 
@@ -95,7 +97,88 @@ def _build_fakes() -> SimpleNamespace:
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, ChatResult
 
+    from datetime import datetime
+
     from cat import AgenticWorkflowOutput
+    from cat.core_plugins.base_plugin.file_managers.custom import LocalFileManager
+    from cat.services.factory.file_manager import BaseFileManager, DummyFileManager, FileResponse
+
+    class ObjectStoreFileManager(BaseFileManager):
+        """File manager with the semantics of an object storage (S3): atomic writes, no folders, no renames."""
+        def __init__(self):
+            super().__init__()
+            self.objects = {}
+            self.hooks = {}  # operation -> callable(path), run before the operation (to simulate the other instances)
+
+        def _hook(self, operation, path):
+            if callable(hook := self.hooks.get(operation)):
+                hook(path)
+
+        def _eq(self, other):
+            return self is other
+
+        def _upload_file(self, file_path, destination_path):  # pragma: no cover - not used by the plugin
+            raise NotImplementedError
+
+        def _download_file_to_local(self, file_path, local_path):  # pragma: no cover - not used by the plugin
+            raise NotImplementedError
+
+        def _download_file(self, file_path):
+            self._hook("download", file_path)
+            return self.objects.get(os.path.normpath(file_path))
+
+        def _read_file(self, file_path):  # pragma: no cover - not used by the plugin
+            return self.objects[os.path.normpath(file_path)]
+
+        def _write_file(self, file_content, file_path):
+            self._hook("write", file_path)
+            content = file_content.encode("utf-8") if isinstance(file_content, str) else bytes(file_content)
+            self.objects[os.path.normpath(file_path)] = content
+
+        def _remove_file(self, file_path):
+            self._hook("remove", file_path)
+            return self.objects.pop(os.path.normpath(file_path), None) is not None
+
+        def _remove_folder(self, remote_root_dir):
+            prefix = os.path.normpath(remote_root_dir) + os.sep
+            for key in [k for k in self.objects if k.startswith(prefix)]:
+                del self.objects[key]
+            return True
+
+        def _list_files(self, remote_root_dir):
+            folder = os.path.normpath(remote_root_dir)
+            return [
+                FileResponse(path=key, name=os.path.basename(key), hash="", size=len(value),
+                             last_modified=datetime.now().strftime("%Y-%m-%d"))
+                for key, value in list(self.objects.items())
+                if os.path.dirname(key) == folder
+            ]
+
+        def _clone_folder(self, remote_root_dir_from, remote_root_dir_to):  # pragma: no cover - not used by the plugin
+            raise NotImplementedError
+
+    def local_file_manager():
+        """The file manager of the core storing on a (shared) folder."""
+        manager = LocalFileManager()
+        manager._root_dir = tempfile.mkdtemp(prefix="cwyd-storage-", dir=modules.data_root)
+        return manager
+
+    class FakeClock:
+        """Replaces the ``time`` module of the plugin: the current time is shifted by ``offset`` seconds."""
+        def __init__(self, offset=0.0):
+            self.offset = offset
+
+        def time(self):
+            return time.time() + self.offset
+
+        def time_ns(self):
+            return time.time_ns() + int(self.offset * 1e9)
+
+        def monotonic(self):
+            return time.monotonic()
+
+        def sleep(self, seconds):
+            self.offset += seconds
 
     class ReactChatModel(BaseChatModel):
         """Chat model replying with the scripted messages, in order, without tool calling (ReAct agents)."""
@@ -133,7 +216,7 @@ def _build_fakes() -> SimpleNamespace:
             return AgenticWorkflowOutput(output=text, with_llm_error=self.with_llm_error)
 
     def make_cat(llm=None, settings=None, user_message="question", chat_id="chat-1", agent_key="agent-1",
-                 history=None, workflow=None, notifier=None):
+                 history=None, workflow=None, notifier=None, file_manager=None):
         working_memory = SimpleNamespace(
             user_message=SimpleNamespace(text=user_message), history=list(history or []),
         )
@@ -158,7 +241,7 @@ def _build_fakes() -> SimpleNamespace:
         return SimpleNamespace(
             large_language_model=llm, agentic_workflow=workflow or Workflow(), mad_hatter=manager,
             plugin_manager=manager, working_memory=working_memory, agent_key=agent_key, id=chat_id,
-            notifier=notifier, state=state,
+            notifier=notifier, state=state, file_manager=file_manager or modules.file_manager,
         )
 
     def message(who, text):
@@ -175,6 +258,8 @@ def _build_fakes() -> SimpleNamespace:
         return AIMessage(content=f"Thought: I know the answer\nFinal Answer: {text}")
 
     return SimpleNamespace(
+        ObjectStoreFileManager=ObjectStoreFileManager, local_file_manager=local_file_manager,
+        DummyFileManager=DummyFileManager, FakeClock=FakeClock,
         ScriptedChatModel=ScriptedChatModel, ReactChatModel=ReactChatModel, Workflow=Workflow, make_cat=make_cat,
         message=message, tool_call=tool_call, react_step=react_step, react_final=react_final, AIMessage=AIMessage,
     )

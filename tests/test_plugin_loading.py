@@ -26,8 +26,7 @@ class PluginLoadingTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted((e.name, tuple(sorted(e.methods))) for e in plugin.endpoints),
-            [("/custom/cat-with-your-data/charts/{agent_id}/{chart_file}", ("GET",)),
-             ("/custom/cat-with-your-data/datasets", ("GET",)),
+            [("/custom/cat-with-your-data/datasets", ("GET",)),
              ("/custom/cat-with-your-data/datasets", ("POST",)),
              ("/custom/cat-with-your-data/datasets/{name}", ("DELETE",))],
         )

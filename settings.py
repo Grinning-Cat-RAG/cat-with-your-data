@@ -60,11 +60,6 @@ class SqlAgentType(Enum):
     TOOL_CALLING = "tool_calling"
 
 
-class ChartDelivery(Enum):
-    INLINE = "inline"
-    URL = "url"
-
-
 class MySettings(BaseModel):
     ds_type: DatasourceType = Field(
         title="datasource type",
@@ -120,16 +115,6 @@ reply to the user briefly, precisely and based on the context of the dialogue.
                     "auto: draw a chart also when the answer is easier to understand visually",
         default=ChartMode.ON_REQUEST,
     )
-    chart_delivery: ChartDelivery = Field(
-        title="chart delivery",
-        description="inline: the chart is embedded in the answer as a base64 markdown image; "
-                    "url: the answer contains a markdown image pointing to the plugin endpoint",
-        default=ChartDelivery.INLINE,
-    )
-    public_base_url: str = Field(
-        title="public base URL of the Cat (used when chart delivery is 'url', e.g. https://cat.example.com)",
-        default="",
-    )
     chart_max_rows: int = Field(
         title="maximum number of rows fetched to draw a chart",
         default=1000,
@@ -154,7 +139,7 @@ reply to the user briefly, precisely and based on the context of the dialogue.
         ge=1,
     )
     chat_datasets_ttl_hours: int = Field(
-        title="hours after which unused chat datasets and generated charts are deleted (0 = never)",
+        title="hours after which the datasets of an idle conversation are deleted (0 = never)",
         default=72,
         ge=0,
     )

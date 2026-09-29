@@ -124,6 +124,7 @@ class SplitDocumentsTest(unittest.TestCase):
         plugin = SimpleNamespace(load_settings=mock.AsyncMock(return_value=support.default_settings()))
         cat.mad_hatter = SimpleNamespace(get_plugin=lambda: plugin)
         cat.notifier = notifier or SimpleNamespace(send_notification=mock.AsyncMock())
+        cat.file_manager = m.file_manager
         return cat
 
     def split(self, docs, cat):
@@ -139,14 +140,15 @@ class SplitDocumentsTest(unittest.TestCase):
         self.assertEqual(docs[0].metadata, {})
         self.assertIn("can be queried in this conversation (tables: sales)", docs[0].page_content)
         cat.notifier.send_notification.assert_awaited_once()
-        store = m.datasets.DatasetStore(cat.agent_key, "chat-9")
+        store = m.datasets.DatasetStore(m.file_manager, cat.agent_key, "chat-9")
         self.assertEqual([d.name for d in store.list_datasets()], ["sales.csv"])
 
     def test_agent_dataset_without_chat(self):
-        cat = SimpleNamespace(agent_key=f"agent-{time.monotonic_ns()}", mad_hatter=self.stray_cat().mad_hatter)
+        cat = SimpleNamespace(agent_key=f"agent-{time.monotonic_ns()}", mad_hatter=self.stray_cat().mad_hatter,
+                              file_manager=m.file_manager)
         docs = self.split(self.docs(self.dataset_doc(name=None)), cat)
         self.assertIn("in every conversation", docs[0].page_content)
-        self.assertEqual([d.scope for d in m.datasets.DatasetStore(cat.agent_key).list_datasets()], ["shared"])
+        self.assertEqual([d.scope for d in m.datasets.DatasetStore(m.file_manager, cat.agent_key).list_datasets()], ["shared"])
 
     def test_payload_never_reaches_the_memory(self):
         # regression: an unexpected error escaping the hook restored the documents with the raw bytes
@@ -162,11 +164,13 @@ class SplitDocumentsTest(unittest.TestCase):
 
 
 class EndpointsTest(unittest.TestCase):
-    def info(self, chat_id=None, permissions=None, agent=True):
+    def info(self, chat_id=None, permissions=None, agent=True, file_manager=None):
         from fastapi import UploadFile  # noqa: F401 - FastAPI is a dependency of the core
         key = f"agent-{time.monotonic_ns()}"
         plugin = SimpleNamespace(load_settings=mock.AsyncMock(return_value=support.default_settings(max_upload_size_mb=1)))
-        cheshire_cat = SimpleNamespace(agent_key=key, mad_hatter=SimpleNamespace(get_plugin=lambda: plugin)) if agent else None
+        cheshire_cat = SimpleNamespace(
+            agent_key=key, mad_hatter=SimpleNamespace(get_plugin=lambda: plugin), file_manager=file_manager or m.file_manager,
+        ) if agent else None
         return SimpleNamespace(
             cheshire_cat=cheshire_cat,
             stray_cat=SimpleNamespace(id=chat_id) if chat_id else None,
@@ -212,18 +216,16 @@ class EndpointsTest(unittest.TestCase):
         info.cheshire_cat.mad_hatter.get_plugin().load_settings.side_effect = RuntimeError("redis down")
         self.assertEqual(self.upload(info).name, "s.csv")
 
-    def test_chart_endpoint(self):
-        from fastapi import FastAPI
-        from fastapi.testclient import TestClient
+    def test_file_manager_without_storage(self):
+        # the default file manager of the core (Dummy) keeps nothing: the upload is refused with an explicit message
+        with self.assertRaises(m.endpoints.CustomValidationException) as error:
+            self.upload(self.info(chat_id="c", file_manager=m.fakes.DummyFileManager()))
+        self.assertIn("configure a file manager", str(error.exception))
 
-        app = FastAPI()
-        m.endpoints.get_chart.activate(app)
-        chart_id = m.charts.save_chart("agent-x", b"\x89PNG")
-        client = TestClient(app)
-        response = client.get(f"/custom/cat-with-your-data/charts/agent-x/{chart_id}.png")
-        self.assertEqual((response.status_code, response.content, response.headers["content-type"]), (200, b"\x89PNG", "image/png"))
-        with self.assertRaises(m.endpoints.CustomNotFoundException):
-            support.run(m.endpoints.get_chart.function(agent_id="agent-x", chart_file="../../etc/passwd"))
+    def test_charts_are_delivered_only_inline(self):
+        self.assertFalse(hasattr(m.endpoints, "get_chart"))
+        self.assertNotIn("chart_delivery", m.settings.MySettings.model_fields)
+        self.assertNotIn("public_base_url", m.settings.MySettings.model_fields)
 
 
 class SettingsTest(unittest.TestCase):

@@ -84,7 +84,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
 
     settings = await _plugin_settings(cat)
     chat_id = cat.id if isinstance(cat, StrayCat) else None
-    store = datasets.DatasetStore(cat.agent_key, chat_id)
+    store = datasets.DatasetStore(cat.file_manager, cat.agent_key, chat_id)
 
     for doc in captured:
         # the raw bytes are always removed: they must never reach the chunker and the vector memory

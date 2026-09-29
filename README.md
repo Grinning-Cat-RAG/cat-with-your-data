@@ -73,18 +73,13 @@ Agent, charts and uploads fields:
 
 - `charts`: `disabled`, `on_request` (default: a chart is drawn only when the user asks for it, in any language) or
   `auto` (a chart is drawn also when comparisons, rankings, trends or distributions are easier to read visually)
-- `chart_delivery`: `inline` (default: the chart is embedded in the answer as a base64 markdown image) or `url`
-  (the answer contains a markdown image pointing to the plugin endpoint, see below)
-- `public_base_url`: public URL of the Cat, used to build the chart URLs when `chart_delivery` is `url`
-  (e.g. `https://cat.example.com`); if empty, the URL is relative
 - `chart_max_rows`: maximum number of rows fetched to draw a chart
 - `thought_max_rows`: maximum number of rows of the chart data shown to the agent after drawing a chart
 - `use_uploaded_datasets`: when a conversation has uploaded datasets, query them instead of the configured datasource
 - `capture_rabbithole_uploads`: register the CSV/SQLite files uploaded through the Rabbit Hole as datasets
 - `max_upload_size_mb`: maximum size of an uploaded dataset
-- `chat_datasets_ttl_hours`: hours after which the generated charts, and the datasets of a conversation not uploaded
-  nor queried meanwhile, are deleted (`0` = never; shared datasets never expire); the expired ones are removed when a
-  dataset is uploaded and when a chart is stored
+- `chat_datasets_ttl_hours`: hours after which the datasets of a conversation not uploaded nor queried meanwhile are
+  deleted (`0` = never; shared datasets never expire); the expired ones are removed when a dataset is uploaded
 
 `chart_max_rows`, `thought_max_rows` and `max_upload_size_mb` must be at least 1, `chat_datasets_ttl_hours` at least 0.
 
@@ -112,7 +107,7 @@ Ready-to-use examples are in `settings_examples/`:
    returns the error message, so that the agent can fix the input and try again. Up to 3 charts per answer.
 4. Non-tabular JSON files are queried by the LangChain JSON agent, without charts.
 5. The final answer is generated with the configured output prompt and chat context; the charts, if any, are appended
-   to the answer as markdown images. If the final LLM call fails, the answer of the agent is returned as it is, with
+   to the answer as markdown images with the PNG embedded (base64): no chart is stored nor served by an endpoint. If the final LLM call fails, the answer of the agent is returned as it is, with
    the charts. The recent conversation is passed to the agent and the answer is saved in the conversation history, so
    follow-up requests ("now show it as a pie chart") keep their context; in the history the inline charts are replaced
    by a `[chart: title]` placeholder, because the core sends the latest messages to the LLM.
@@ -127,8 +122,34 @@ shared dataset therefore replaces the configured datasource in every conversatio
 All the datasets visible in a conversation are exposed as one read-only SQLite database: every CSV file becomes a
 table named after the file, every SQLite file brings its own tables (the files are processed in alphabetical order and
 a clashing table name gets a suffix, e.g. `sales_2`). A single SQLite file is used as it is, with its views and
-indexes. Uploading a dataset with the name of an existing one replaces it. Every request reads the datasets as they
-were when it started, even if they are replaced meanwhile.
+indexes. Uploading a dataset with the name of an existing one replaces it; the most recent upload wins, whatever the
+clock of the instance that received it. Every request reads the datasets as they were when it started, even if they
+are replaced, removed or expired meanwhile, on any instance.
+
+### Storage and several instances
+
+The datasets are stored with the **file manager of the agent** (the service configured for the agent in the Cat: a
+folder, S3, ...), the same one that stores the files uploaded to the Rabbit Hole; the plugin never writes on the local
+disk of the instance (pod), so any instance may receive an upload and any instance may answer the following questions.
+
+- The default file manager of the core (`DummyFileManager`) keeps nothing: until a file manager is configured for the
+  agent, the uploads are refused with an explicit error.
+- Paths (relative to the root of the file manager): `<agent>/<chat>/cat_with_your_data/` for the datasets of a
+  conversation, removed by the core with the conversation; `<agent>/cat_with_your_data/` for the shared datasets,
+  removed with the agent; `<agent>/cat_with_your_data/_chats/<chat>` for the last activity of the conversations.
+- The file managers have neither renames nor locks: every upload is a new object named
+  `<timestamp>-<checksum>--<name>` and the older copies are removed; a request downloads the datasets and works on
+  them in memory, so what is uploaded, removed or expired meanwhile never affects it. A copy whose content does not
+  match its checksum is being written (the request retries) or its upload was interrupted (after one minute it is
+  ignored, and the previous copy is used).
+- The cleanup of an idle conversation removes only the datasets uploaded before the expiration threshold: an upload
+  received meanwhile by another instance is never lost.
+- Every instance keeps the most recent workspaces in memory (up to 256 MB, `WORKSPACE_CACHE_BYTES` in `datasets.py`);
+  since the stored objects never change, a cached workspace is never stale. Each question lists the datasets of the
+  conversation and records its activity (a small write), and every instance downloads the datasets it does not have
+  in memory yet: large datasets cost memory and transfer time.
+- The core copies the files of an agent to a new file manager only at the first level of the agent folder: the datasets
+  are not moved when the file manager of the agent changes, and must be uploaded again.
 
 CSV files (both uploaded and configured through `host`) are read detecting separator and encoding. In the files
 separated by `;`, as exported with European locales, the numbers are read column by column: a column is read with `,`
@@ -168,13 +189,6 @@ curl -X POST "http://localhost:1865/custom/cat-with-your-data/datasets?chat_id=m
   -F "file=@sales.csv"
 ```
 
-### Chart endpoint
-
-- `GET /custom/cat-with-your-data/charts/{agent_id}/{chart_id}.png`: returns a chart generated with
-  `chart_delivery` set to `url`. This endpoint is not authenticated, because `<img>` tags cannot send credentials:
-  the chart id is a random 128-bit token and works as a capability URL. Charts are deleted after
-  `chat_datasets_ttl_hours`.
-
 ## Usage
 
 1. Install the plugin in your Grinning Cat environment.
@@ -188,14 +202,15 @@ curl -X POST "http://localhost:1865/custom/cat-with-your-data/datasets?chat_id=m
 ## Notes
 
 - For `CSV`, `JSON` and `SQLite`, set `host` to a readable file path.
-- For SQL datasources, verify connectivity and credentials from the Cat runtime environment. The chart queries are
-  validated as read-only, and the uploaded datasets and the configured CSV and JSON files are opened read-only, but
-  the standard `sql_db_query` tool of the SQL agent can run any statement on the configured SQL databases: use a
-  database user with read-only privileges. On every SQLite connection of the plugin (configured SQLite file included)
-  `ATTACH` is disabled, so the agent cannot open other files of the host.
+- For SQL datasources, verify connectivity and credentials from the Cat runtime environment. The queries of the agent
+  (`sql_db_query` and the chart queries) are accepted only if they are a single `SELECT`/`WITH` statement without
+  data-modifying keywords, and the sessions are read-only where the database allows it: PostgreSQL
+  (`default_transaction_read_only`), MySQL (`SET SESSION TRANSACTION READ ONLY`), SQLite (`query_only`, also for the
+  uploaded datasets and the configured CSV and JSON files). For Oracle and SQL Server only the validation applies:
+  in any case, use a database user with read-only privileges. On every SQLite connection of the plugin `ATTACH` is
+  disabled, so the agent cannot open other files of the host.
 - The schema of the configured SQL datasources is cached for 10 minutes: changes of the tables are seen after that.
-- Uploaded datasets and URL charts are stored on the local disk (`<cat data folder>/cat_with_your_data`): with
-  multiple replicas, this folder must be on a shared volume.
+- Uploaded datasets are stored with the file manager of the agent (see "Storage and several instances").
 - Charts are drawn by the agent within its usual reasoning steps: no extra LLM call is needed.
 - Unlike pandas-ai, the LLM does not write Python code: it writes SQL and a chart specification, and the chart is
   rendered by the plugin. This is safer and passes the Grinning Cat plugin security scan (which forbids `exec`/`eval`),
@@ -223,11 +238,11 @@ time and must pass the security scan (`test_plugin_loading.py` checks it).
 
 New features:
 
-- Charts drawn by the SQL agent through the `draw_chart` tool (`charts`, `chart_delivery`, `public_base_url`,
-  `chart_max_rows`, `thought_max_rows` settings), delivered inline (base64) or through the chart endpoint.
+- Charts drawn by the SQL agent through the `draw_chart` tool (`charts`, `chart_max_rows`, `thought_max_rows`
+  settings), embedded in the answer (base64).
 - CSV and SQLite datasets uploaded on the fly, per conversation or for the whole agent, through the Rabbit Hole or the
-  plugin endpoints (`use_uploaded_datasets`, `capture_rabbithole_uploads`, `max_upload_size_mb`,
-  `chat_datasets_ttl_hours` settings).
+  plugin endpoints, stored with the file manager of the agent (`use_uploaded_datasets`, `capture_rabbithole_uploads`,
+  `max_upload_size_mb`, `chat_datasets_ttl_hours` settings).
 - `agent_type` setting, to use native tool calling when the LLM supports it.
 - The recent conversation is passed to the agent, so that follow-up questions work.
 
@@ -249,6 +264,8 @@ Changed behaviours:
 - `{chat_history}` in `output_prompt` is now a list of `- who: text` lines (last 10 messages, charts replaced by a
   placeholder) instead of the Python representation of a list.
 - Database usernames and passwords are URL-encoded in the connection string, and the password is masked in the logs.
+- The agent can only read the configured databases: its queries must be a single `SELECT`/`WITH` statement (so
+  `SHOW`, `EXPLAIN`, `PRAGMA` are refused too), and the sessions are read-only on PostgreSQL, MySQL and SQLite.
 
 Bug fixes:
 
