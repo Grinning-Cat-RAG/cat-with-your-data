@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Protocol, Tuple
 
-#: settings encrypted at rest: every field whose key contains "_secret"
-SECRET_SETTINGS = ("password")
+#: settings encrypted at rest (exact keys)
+SECRET_SETTINGS = ("password",)
 
 
 class Crypto(Protocol):
@@ -36,4 +36,3 @@ def decrypt_secrets(settings: Dict[str, Any], crypto: Crypto) -> Tuple[Dict[str,
             decrypted[key] = ""
             failed.append(key)
     return decrypted, failed
-    

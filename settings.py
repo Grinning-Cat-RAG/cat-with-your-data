@@ -1,8 +1,8 @@
-from typing import Dict, Any
-from pydantic import BaseModel, Field
 from enum import Enum
+from typing import Dict, Any
+from pydantic import BaseModel, Field, field_validator
 
-from cat import plugin
+from cat import plugin, log
 from cat.db.cruds import plugins as crud_plugins
 from cat.services.string_crypto import StringCrypto
 
@@ -24,7 +24,7 @@ datasources = {
     },
     "Microsoft SQL Server": {
         "agent_type": "sql",
-        "conn_str": "mssql+pymssql://scott:{host}@{host}:{port}/{database}"
+        "conn_str": "mssql+pymssql://{username}:{password}@{host}:{port}/{database}"
     },
     "Microsoft SQL Server ODBC": {
         "agent_type": "sql",
@@ -42,8 +42,28 @@ datasources = {
     }
 }
 
-# Create a dynamic enum for database types
-DatasourceType = Enum("DatasourceType", [(key.replace(" ", "_"), key) for key, _ in datasources.items()])
+# Create a dynamic enum for database types; the empty value means "no configured datasource" (only uploaded datasets)
+DatasourceType = Enum(
+    "DatasourceType", [("NONE", "")] + [(key.replace(" ", "_"), key) for key, _ in datasources.items()]
+)
+
+
+class ChartMode(Enum):
+    DISABLED = "disabled"
+    ON_REQUEST = "on_request"
+    AUTO = "auto"
+
+
+class SqlAgentType(Enum):
+    AUTO = "auto"
+    REACT = "react"
+    TOOL_CALLING = "tool_calling"
+
+
+class ChartDelivery(Enum):
+    INLINE = "inline"
+    URL = "url"
+
 
 class MySettings(BaseModel):
     ds_type: DatasourceType = Field(
@@ -56,7 +76,7 @@ class MySettings(BaseModel):
     )
     port: int = Field(
         title="port",
-        default=""
+        default=0
     )
     username: str = Field(
         title="username",
@@ -87,6 +107,63 @@ reply to the user briefly, precisely and based on the context of the dialogue.
 - Thought: {thought}
 - AI:""",
     )
+    agent_type: SqlAgentType = Field(
+        title="SQL agent type",
+        description="auto: tool calling if the LLM supports it, otherwise ReAct; react: text-based ReAct agent "
+                    "(works with every LLM); tool_calling: native tool calling (more reliable, needs a chat model "
+                    "supporting tools)",
+        default=SqlAgentType.AUTO,
+    )
+    charts: ChartMode = Field(
+        title="charts",
+        description="disabled: never draw charts; on_request: draw a chart only when the user asks for it; "
+                    "auto: draw a chart also when the answer is easier to understand visually",
+        default=ChartMode.ON_REQUEST,
+    )
+    chart_delivery: ChartDelivery = Field(
+        title="chart delivery",
+        description="inline: the chart is embedded in the answer as a base64 markdown image; "
+                    "url: the answer contains a markdown image pointing to the plugin endpoint",
+        default=ChartDelivery.INLINE,
+    )
+    public_base_url: str = Field(
+        title="public base URL of the Cat (used when chart delivery is 'url', e.g. https://cat.example.com)",
+        default="",
+    )
+    chart_max_rows: int = Field(
+        title="maximum number of rows fetched to draw a chart",
+        default=1000,
+        ge=1,
+    )
+    thought_max_rows: int = Field(
+        title="maximum number of rows of the chart data shown to the agent",
+        default=30,
+        ge=1,
+    )
+    use_uploaded_datasets: bool = Field(
+        title="query the uploaded CSV/SQLite datasets instead of the configured datasource, when available",
+        default=True,
+    )
+    capture_rabbithole_uploads: bool = Field(
+        title="register the CSV/SQLite files uploaded through the Rabbit Hole as queryable datasets",
+        default=True,
+    )
+    max_upload_size_mb: int = Field(
+        title="maximum size (MB) of an uploaded dataset",
+        default=100,
+        ge=1,
+    )
+    chat_datasets_ttl_hours: int = Field(
+        title="hours after which unused chat datasets and generated charts are deleted (0 = never)",
+        default=72,
+        ge=0,
+    )
+
+    # file datasources have no port: the examples (and the settings saved by previous versions) leave it empty
+    @field_validator("port", mode="before")
+    @classmethod
+    def _empty_port(cls, value):
+        return 0 if value in ("", None) else value
 
 
 def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
@@ -99,6 +176,11 @@ def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     return settings
 
 
+def _with_defaults(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Stored settings completed with the defaults of the fields added in later versions."""
+    return {**MySettings().model_dump(mode="json"), **(settings or {})}
+
+
 @plugin
 def settings_schema():
     return MySettings.model_json_schema()
@@ -108,11 +190,11 @@ def settings_schema():
 async def load_settings(plugin_id: str, agent_id: str) -> Dict[str, Any]:
     stored = await crud_plugins.get_setting(agent_id, plugin_id)
     if stored is None:
-        return MySettings().model_dump()
-    return _decrypted(stored, agent_id)
+        return MySettings().model_dump(mode="json")
+    return _with_defaults(_decrypted(stored, agent_id))
 
 
 @plugin
 async def save_settings(plugin_id: str, settings: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
     stored = await crud_plugins.update_setting(agent_id, plugin_id, encrypt_secrets(settings, StringCrypto()))
-    return _decrypted(stored, agent_id)
+    return _with_defaults(_decrypted(stored, agent_id))

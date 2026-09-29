@@ -1,0 +1,21 @@
+{
+    "host": "",
+    "port": "",
+    "username": "",
+    "password": "",
+    "database": "",
+    "ds_type": "",
+    "extra": "",
+    "input_prompt": "{user_message}",
+    "output_prompt": "{prompt_prefix}\nYou have elaborated the user's question, \nyou have searched for the answer and now you \nhave the solution in your Thought; \nreply to the user briefly, \nprecisely and based on the context \nof the dialogue.\nAnswer me in Italian language.\n- Human: {user_message}\n- Thought: {thought}\n- AI:",
+    "agent_type": "auto",
+    "charts": "auto",
+    "chart_delivery": "inline",
+    "public_base_url": "",
+    "chart_max_rows": 1000,
+    "thought_max_rows": 30,
+    "use_uploaded_datasets": true,
+    "capture_rabbithole_uploads": true,
+    "max_upload_size_mb": 100,
+    "chat_datasets_ttl_hours": 72
+}

@@ -1,10 +1,21 @@
 [project]
 name = "cat-with-your-data"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "langchain-experimental",
+    "langchain-classic",
+    "langchain-community",
+    "matplotlib",
     "mysql-connector-python",
+    "pandas",
     "psycopg2-binary",
+    "sqlalchemy",
     "tabulate==0.9.0",
+]
+
+# only for the test suite (see the README): `uv sync` installs the "dev" group by default, not this one
+[dependency-groups]
+test = [
+    "coverage",
+    "hypothesis",
 ]

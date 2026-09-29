@@ -1,10 +1,10 @@
 {
     "name": "Cat With Your Data",
-    "version": "0.1.0",
-    "description": "A plugin that allows you to query your data in CSV, JSON, or SQL format using natural language. Just upload your data and ask your questions!",
+    "version": "0.2.0",
+    "description": "A plugin that allows you to query your data in CSV, JSON, SQLite or SQL format using natural language, getting answers and charts. Configure a datasource or just upload CSV and SQLite files on the fly, and ask your questions!",
     "author_name": "Matteo Cacciola",
     "author_url": "https://github.com/matteocacciola",
-    "plugin_url": "https://github.com/matteocacciola/cat-with-your-data",
-    "tags": "data, csv, json, sql, natural language processing",
-    "thumb": "https://raw.githubusercontent.com/matteocacciola/cat-with-your-data/main/thumb.jpg"
+    "plugin_url": "https://github.com/Grinning-Cat-RAG/cat-with-your-data",
+    "tags": "data, csv, json, sql, sqlite, charts, data visualization, natural language processing",
+    "thumb": "https://raw.githubusercontent.com/Grinning-Cat-RAG/cat-with-your-data/main/thumb.jpg"
 }
