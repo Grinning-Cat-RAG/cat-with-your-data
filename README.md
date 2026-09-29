@@ -8,18 +8,17 @@ It can reason over SQL databases, SQLite, CSV and JSON files, and over CSV/SQLit
 
 ## What It Does
 
-- Turns user questions into datasource-aware reasoning steps.
+- Turns user questions into queries on your data, and answers in natural language.
 - Draws charts (bar, horizontal bar, line, area, pie, scatter, histogram) when the user asks for them, or
-  automatically when a visualization makes the answer clearer.
+  automatically when a visualization makes the answer clearer. The charts are part of the answer.
 - Lets users upload CSV and SQLite files on the fly, per conversation or for the whole agent.
-- Uses dedicated LangChain agents for SQL (also used for CSV files, tabular JSON files and uploaded datasets) and
-  JSON. Charts are drawn by the SQL agent itself, through an extra `draw_chart` tool.
+- Keeps the context of the conversation, so follow-up requests work ("now show it as a pie chart").
 - Supports custom `input_prompt` and `output_prompt` templates.
-- Works with multiple SQL engines through SQLAlchemy connection strings.
+
+Unlike pandas-ai, the LLM never writes Python code: it writes SQL and a chart specification, and the plugin draws the
+chart.
 
 ## Supported Datasources
-
-From `settings.py`, the plugin supports:
 
 - `PostgreSQL`
 - `MySQL`
@@ -28,34 +27,26 @@ From `settings.py`, the plugin supports:
 - `Microsoft SQL Server ODBC`
 - `SQLite`
 - `CSV`
-- `JSON`: tabular JSON files (a list of records, or an object of lists of records) are loaded as tables and queried
-  by the SQL agent, so charts are available; the other JSON files are queried by the JSON agent, without charts
+- `JSON`: tabular JSON files (a list of records, or an object of lists of records) can be charted; the other JSON files
+  are queried without charts
 - CSV (`.csv`, `.tsv`) and SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`) files uploaded on the fly
 
-Reference for SQLAlchemy connection formats:
-
-https://docs.sqlalchemy.org/en/20/core/engines.html
+Reference for SQLAlchemy connection formats: https://docs.sqlalchemy.org/en/20/core/engines.html
 
 ## Requirements
 
-Python dependencies are declared in `pyproject.toml`:
-
-- `langchain-classic`, `langchain-community`
-- `matplotlib` (charts)
-- `pandas`, `sqlalchemy`, `tabulate==0.9.0`
-- `mysql-connector-python`, `psycopg2-binary`
-
-Depending on your datasource, additional DB drivers may be required by SQLAlchemy.
+- Grinning Cat, with a file manager configured for the agent (to upload datasets and to use CSV, JSON and SQLite files)
+- The Python dependencies in `pyproject.toml`, installed with the plugin; depending on your datasource, additional DB
+  drivers may be required by SQLAlchemy.
 
 ## Configuration
-
-Plugin settings are defined in `settings.py` and loaded at runtime.
 
 Datasource fields:
 
 - `ds_type`: datasource type (for example `PostgreSQL`, `CSV`, `JSON`); it can be left empty if you only work with
   uploaded datasets
-- `host`: DB host or local file path for CSV/JSON/SQLite
+- `host`: DB host; for CSV, JSON and SQLite, the path of the file in the files of the agent (e.g. `sales.csv`, a file
+  uploaded in the memory of the agent)
 - `port`: DB port (it can be left empty for file datasources)
 - `username`: DB username
 - `password`: DB password (stored encrypted)
@@ -65,12 +56,8 @@ Datasource fields:
 
 Agent, charts and uploads fields:
 
-- `agent_type`: type of the LangChain SQL agent. `auto` (default) uses native tool calling when the configured LLM is a
-  chat model supporting tools, otherwise ReAct; `react` forces the text-based ReAct agent, which works with every LLM
-  but passes the chart arguments as a JSON string and is more error-prone with small models; `tool_calling` forces
-  native tool calling (with an LLM without tools the SQL agent cannot be created: the error is logged and the plugin
-  does not answer)
-
+- `agent_type`: `auto` (default: native tool calling when the LLM supports it, otherwise ReAct), `react` (works with
+  every LLM, more error-prone with small models) or `tool_calling` (needs an LLM with tools)
 - `charts`: `disabled`, `on_request` (default: a chart is drawn only when the user asks for it, in any language) or
   `auto` (a chart is drawn also when comparisons, rankings, trends or distributions are easier to read visually)
 - `chart_max_rows`: maximum number of rows fetched to draw a chart
@@ -78,106 +65,46 @@ Agent, charts and uploads fields:
 - `use_uploaded_datasets`: when a conversation has uploaded datasets, query them instead of the configured datasource
 - `capture_rabbithole_uploads`: register the CSV/SQLite files uploaded through the Rabbit Hole as datasets
 - `max_upload_size_mb`: maximum size of an uploaded dataset
-- `chat_datasets_ttl_hours`: hours after which the datasets of a conversation not uploaded nor queried meanwhile are
-  deleted (`0` = never; shared datasets never expire); the expired ones are removed when a dataset is uploaded
+- `chat_datasets_ttl_hours`: hours after which the datasets of a conversation not used meanwhile are deleted (`0` =
+  never; shared datasets never expire)
 
-`chart_max_rows`, `thought_max_rows` and `max_upload_size_mb` must be at least 1, `chat_datasets_ttl_hours` at least 0.
+Ready-to-use examples are in `settings_examples/`.
 
-Ready-to-use examples are in `settings_examples/`:
-
-- `settings-postgres.json`
-- `settings-mysql.json`
-- `settings-csv.json`
-- `settings-json.json`
-- `settings-prompt.json`
-- `settings-examples.json`
-- `settings-charts-uploads.json`
-
-## How It Works
-
-1. The hook `agent_fast_reply` (in `query_cat.py`) initializes `QueryCatAgent`.
-2. `QueryCatAgent` (in `query_agent.py`) loads settings and picks the datasource: the uploaded datasets, if any,
-   otherwise the configured one. SQL datasources, CSV files, tabular JSON files and uploaded datasets are all exposed
-   as SQL databases (CSV and JSON files are loaded in an in-memory SQLite database).
-3. The LangChain SQL agent (`create_sql_agent`) explores the schema and queries the data with the standard tools of
-   `SQLDatabaseToolkit`. When charts are enabled, it also gets the `draw_chart` tool (in `chart_tool.py`), whose
-   description tells the agent when to use it according to the `charts` setting. The tool receives a read-only SQL
-   query and a chart specification, validates the query (single `SELECT`/`WITH` statement, no data-modifying
-   keywords), runs it, renders the chart with matplotlib and returns the plotted data to the agent; on errors, it
-   returns the error message, so that the agent can fix the input and try again. Up to 3 charts per answer.
-4. Non-tabular JSON files are queried by the LangChain JSON agent, without charts.
-5. The final answer is generated with the configured output prompt and chat context; the charts, if any, are appended
-   to the answer as markdown images with the PNG embedded (base64): no chart is stored nor served by an endpoint. If the final LLM call fails, the answer of the agent is returned as it is, with
-   the charts. The recent conversation is passed to the agent and the answer is saved in the conversation history, so
-   follow-up requests ("now show it as a pie chart") keep their context; in the history the inline charts are replaced
-   by a `[chart: title]` placeholder, because the core sends the latest messages to the LLM.
+**Use a database user with read-only privileges** (e.g. on PostgreSQL `GRANT SELECT` on the tables to query, and
+nothing else): the plugin accepts only read-only queries without side effects, but only the privileges of the user
+guarantee that nothing can be changed.
 
 ## Uploading Datasets On The Fly
 
-Uploaded datasets are visible in a single conversation (when a chat id is given) or in every conversation of the
-agent (shared datasets); a dataset of the conversation wins over a shared one with the same name. When a conversation
-sees at least one uploaded dataset, the configured datasource is not used (unless `use_uploaded_datasets` is off): a
-shared dataset therefore replaces the configured datasource in every conversation of the agent.
+Uploaded datasets are visible only to the user who uploaded them, in a single conversation (when a chat id is given),
+or in every conversation of the agent (shared datasets). A dataset of the conversation wins over a shared one with the
+same name, and uploading a dataset with the name of an existing one replaces it. When a conversation sees at least one
+uploaded dataset, the configured datasource is not used (unless `use_uploaded_datasets` is off).
 
-All the datasets visible in a conversation are exposed as one read-only SQLite database: every CSV file becomes a
-table named after the file, every SQLite file brings its own tables (the files are processed in alphabetical order and
-a clashing table name gets a suffix, e.g. `sales_2`). A single SQLite file is used as it is, with its views and
-indexes. Uploading a dataset with the name of an existing one replaces it; the most recent upload wins, whatever the
-clock of the instance that received it. Every request reads the datasets as they were when it started, even if they
-are replaced, removed or expired meanwhile, on any instance.
+All the datasets visible in a conversation are queried together: every CSV file becomes a table named after the file,
+every SQLite file brings its own tables (a clashing table name gets a suffix, e.g. `sales_2`).
 
-### Storage and several instances
+The datasets of a conversation are deleted with the conversation; the shared ones with the agent.
 
-The datasets are stored with the **file manager of the agent** (the service configured for the agent in the Cat: a
-folder, S3, ...), the same one that stores the files uploaded to the Rabbit Hole; the plugin never writes on the local
-disk of the instance (pod), so any instance may receive an upload and any instance may answer the following questions.
-
-- The default file manager of the core (`DummyFileManager`) keeps nothing: until a file manager is configured for the
-  agent, the uploads are refused with an explicit error.
-- Paths (relative to the root of the file manager): `<agent>/<chat>/cat_with_your_data/` for the datasets of a
-  conversation, removed by the core with the conversation; `<agent>/cat_with_your_data/` for the shared datasets,
-  removed with the agent; `<agent>/cat_with_your_data/_chats/<chat>` for the last activity of the conversations.
-- The file managers have neither renames nor locks: every upload is a new object named
-  `<timestamp>-<checksum>--<name>` and the older copies are removed; a request downloads the datasets and works on
-  them in memory, so what is uploaded, removed or expired meanwhile never affects it. A copy whose content does not
-  match its checksum is being written (the request retries) or its upload was interrupted (after one minute it is
-  ignored, and the previous copy is used).
-- The cleanup of an idle conversation removes only the datasets uploaded before the expiration threshold: an upload
-  received meanwhile by another instance is never lost.
-- Every instance keeps the most recent workspaces in memory (up to 256 MB, `WORKSPACE_CACHE_BYTES` in `datasets.py`);
-  since the stored objects never change, a cached workspace is never stale. Each question lists the datasets of the
-  conversation and records its activity (a small write), and every instance downloads the datasets it does not have
-  in memory yet: large datasets cost memory and transfer time.
-- The core copies the files of an agent to a new file manager only at the first level of the agent folder: the datasets
-  are not moved when the file manager of the agent changes, and must be uploaded again.
-
-CSV files (both uploaded and configured through `host`) are read detecting separator and encoding. In the files
-separated by `;`, as exported with European locales, the numbers are read column by column: a column is read with `,`
-as decimal mark and `.` as thousands separator when its values use the comma (`2,5` is 2.5, `1.200,5` is 1200.5) or
-when all its values with a dot are thousands groups (`1.200` is 1200); otherwise the usual format is used (`1.5` is
-1.5). Columns with `dd/mm/yyyy` dates are converted to ISO dates (`yyyy-mm-dd`), so that they can be sorted and
-grouped.
+CSV files are read detecting separator and encoding; in the files separated by `;` (European locales) numbers such as
+`1.200,5` are recognized, and `dd/mm/yyyy` dates become ISO dates.
 
 ### Through the Rabbit Hole
 
 Upload a CSV or SQLite file with the standard upload (`POST /rabbithole/{chat_id}` for a conversation,
-`POST /rabbithole/` for the whole agent). The plugin registers the file as a dataset and stores in the Cat's memory a
-description of it (tables, columns, first rows) instead of the raw content: with `capture_rabbithole_uploads` on, CSV
-files are no longer ingested as text for the RAG. Other text files are ingested as usual, and so are the CSV files that
-cannot be read as tables.
+`POST /rabbithole/` for the whole agent). The plugin registers the file as a dataset and stores in the memory of the Cat a
+description of it (tables, columns, first rows) instead of the raw content. Other files are ingested as usual.
 
 - The Rabbit Hole requires the upload permission (`UPLOAD/WRITE`).
 - The core recognizes CSV files only when their first 8 KB are valid UTF-8: CSV files with other encodings must be
   uploaded through the plugin API.
-- A dataset larger than `max_upload_size_mb` makes the ingestion fail with an explicit error, notified to the user.
 
 ### Through the plugin API
 
 All endpoints require the usual authentication and the `X-Agent-ID` header (or `agent_id` query parameter). Pass the
 chat id (`X-Chat-ID` header or `chat_id` query parameter) to work on the datasets of a conversation; without the chat
 id you work on the shared datasets. The endpoints require the `CHAT` permission (`WRITE` to upload, `READ` to list,
-`DELETE` to delete); uploading or deleting a shared dataset also requires `UPLOAD/WRITE`. Note that the default
-permissions of a new user include `CHAT`, so every user can upload datasets in their conversations.
+`DELETE` to delete); uploading or deleting a shared dataset also requires `UPLOAD/WRITE`.
 
 - `POST /custom/cat-with-your-data/datasets`: upload a dataset (multipart form, field `file`)
 - `GET /custom/cat-with-your-data/datasets`: list the visible datasets, with tables and columns
@@ -199,38 +126,15 @@ curl -X POST "http://localhost:1865/custom/cat-with-your-data/datasets?chat_id=m
    - "Which item has the highest revenue? Draw a bar chart of the top 10."
    - "Now show it as a pie chart."
 
-## Notes
-
-- For `CSV`, `JSON` and `SQLite`, set `host` to a readable file path.
-- For SQL datasources, verify connectivity and credentials from the Cat runtime environment. The queries of the agent
-  (`sql_db_query` and the chart queries) are accepted only if they are a single `SELECT`/`WITH` statement without
-  data-modifying keywords, and the sessions are read-only where the database allows it: PostgreSQL
-  (`default_transaction_read_only`), MySQL (`SET SESSION TRANSACTION READ ONLY`), SQLite (`query_only`, also for the
-  uploaded datasets and the configured CSV and JSON files). For Oracle and SQL Server only the validation applies:
-  in any case, use a database user with read-only privileges. On every SQLite connection of the plugin `ATTACH` is
-  disabled, so the agent cannot open other files of the host.
-- The schema of the configured SQL datasources is cached for 10 minutes: changes of the tables are seen after that.
-- Uploaded datasets are stored with the file manager of the agent (see "Storage and several instances").
-- Charts are drawn by the agent within its usual reasoning steps: no extra LLM call is needed.
-- Unlike pandas-ai, the LLM does not write Python code: it writes SQL and a chart specification, and the chart is
-  rendered by the plugin. This is safer and passes the Grinning Cat plugin security scan (which forbids `exec`/`eval`),
-  but only the supported chart types can be drawn.
-- If needed, tune `input_prompt` to inject query hints and business rules.
+If needed, tune `input_prompt` to inject query hints and business rules.
 
 ## Tests
 
-The tests live in `tests/`: unit tests with 100% branch coverage and stateful, property-based tests (with fault
-injection) of the invariants listed in `tests/test_invariants.py`. Run them from the root of grinning-cat-core, in
-its virtual environment with the plugin dependencies and the `test` dependency group installed:
+From the root of grinning-cat-core, in its virtual environment:
 
 ```bash
 python -m unittest discover -s cat/plugins/cat-with-your-data/tests
-# deeper search of the property-based tests
-CWYD_EXAMPLES=300 python -m unittest discover -s cat/plugins/cat-with-your-data/tests -p "test_invariants.py"
 ```
-
-The Cat imports and scans every `.py` file of the plugin: the test modules import only the standard library at import
-time and must pass the security scan (`test_plugin_loading.py` checks it).
 
 ## Changelog
 
@@ -238,42 +142,31 @@ time and must pass the security scan (`test_plugin_loading.py` checks it).
 
 New features:
 
-- Charts drawn by the SQL agent through the `draw_chart` tool (`charts`, `chart_max_rows`, `thought_max_rows`
-  settings), embedded in the answer (base64).
+- Charts in the answers (`charts`, `chart_max_rows`, `thought_max_rows` settings).
 - CSV and SQLite datasets uploaded on the fly, per conversation or for the whole agent, through the Rabbit Hole or the
-  plugin endpoints, stored with the file manager of the agent (`use_uploaded_datasets`, `capture_rabbithole_uploads`,
-  `max_upload_size_mb`, `chat_datasets_ttl_hours` settings).
+  plugin endpoints (`use_uploaded_datasets`, `capture_rabbithole_uploads`, `max_upload_size_mb`,
+  `chat_datasets_ttl_hours` settings).
 - `agent_type` setting, to use native tool calling when the LLM supports it.
-- The recent conversation is passed to the agent, so that follow-up questions work.
+- Follow-up questions keep the context of the conversation.
 
 Changed behaviours:
 
-- The configured CSV file is no longer queried by the pandas agent of `langchain-experimental`, which executes Python
-  code written by the LLM: it is loaded in an in-memory SQLite database and queried by the SQL agent.
-  `langchain-experimental` is no longer a dependency; `langchain-classic`, `langchain-community`, `matplotlib`,
-  `pandas` and `sqlalchemy` are declared explicitly.
-- Tabular JSON files are queried by the SQL agent (the JSON agent is still used for the other JSON files).
-- In CSV files separated by `;` the numbers in European format (`1.200,5`) are recognized; `dd/mm/yyyy` dates become
-  ISO dates.
-- The `agent_fast_reply` hook now has priority 0, so that it runs after the core `memory` plugin, whose canned reply
-  (when no declarative memory is recalled) used to override the answer of this plugin.
-- The answers of the plugin are saved in the conversation history (inline charts replaced by a `[chart: title]`
-  placeholder): before, the fast reply skipped the core hook that saves them, so they disappeared from the history.
+- The configured CSV file is no longer queried by the LLM writing Python code: it is queried with SQL.
+- Tabular JSON files can be charted.
+- In CSV files separated by `;` the European number format is recognized; `dd/mm/yyyy` dates become ISO dates.
+- The answers of the plugin are saved in the conversation history (charts replaced by a `[chart: title]` placeholder).
+- The configured CSV, JSON and SQLite files are read from the files of the agent (`host`: their path).
+- The datasets of a conversation belong to the user who uploaded them.
 - With `capture_rabbithole_uploads` on (default), the CSV and SQLite files uploaded through the Rabbit Hole become
-  datasets and only their description goes into the memory: CSV files are no longer ingested as text.
-- `{chat_history}` in `output_prompt` is now a list of `- who: text` lines (last 10 messages, charts replaced by a
-  placeholder) instead of the Python representation of a list.
-- Database usernames and passwords are URL-encoded in the connection string, and the password is masked in the logs.
-- The agent can only read the configured databases: its queries must be a single `SELECT`/`WITH` statement (so
-  `SHOW`, `EXPLAIN`, `PRAGMA` are refused too), and the sessions are read-only on PostgreSQL, MySQL and SQLite.
+  datasets and only their description goes into the memory.
+- `{chat_history}` in `output_prompt` is now a list of `- who: text` lines.
+- The agent can only read the configured databases: only read-only queries without side effects are accepted.
 
 Bug fixes:
 
-- The password was encrypted when saved but never decrypted (`SECRET_SETTINGS` was a string instead of a tuple),
-  so the connection string contained the encrypted value.
-- `settings.py` used `log` without importing it.
+- The password was encrypted when saved but never decrypted.
 - The `Microsoft SQL Server` connection string used a hard-coded user and the host as password.
 - The agent output was returned as the string representation of the whole result dictionary.
-- Braces in the thought or in the user message (e.g. JSON data) broke the prompt template of the final answer.
+- Braces in the thought or in the user message (e.g. JSON data) broke the final answer.
 - Settings saved by previous versions are completed with the defaults of the new fields.
-- `ds_type` and `port` can be left empty (the examples for CSV and JSON files could not be saved).
+- `ds_type` and `port` can be left empty.

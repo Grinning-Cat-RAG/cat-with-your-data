@@ -122,10 +122,10 @@ class DeliveryTest(unittest.TestCase):
 
 class ChartToolTest(unittest.TestCase):
     def setUp(self):
-        tmp = Path(tempfile.mkdtemp())
+        tmp = support.temporary_folder(self)
         path = tmp / "sales.csv"
         path.write_text("region,amount\nN,10\nS,20\nE,5\n")
-        self.engine = m.data_engine.engine_from_csv(str(path))
+        self.engine = m.data_engine.engine_from_csv(support.configured_file(path.name, path.read_bytes()))
         self.collector = m.chart_tool.ChartCollector()
 
     def factory(self, mode="on_request", summary_rows=30, max_rows=1000):

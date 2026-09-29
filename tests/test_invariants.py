@@ -2,8 +2,12 @@
 
 Invariants:
 
-- isolation: a conversation sees exactly the shared datasets and its own ones (its own win on name clashes), never
-  the datasets of another conversation;
+- isolation: a user in a conversation sees exactly the shared datasets and its own ones in the conversation (its own
+  win on name clashes), never the datasets of another conversation, nor those of another user in the same conversation
+  (the chat id is chosen by the client);
+- conversations: deleting a conversation (as the core does, removing ``<agent>/<chat>``) removes the datasets of all
+  its users and nothing else, whatever the chat id (also ``cat_with_your_data``, ``system``, ``_chats``); the shared
+  datasets survive the deletion of any conversation;
 - freshness: querying the datasets of a conversation returns the content of the latest successful upload of each
   visible dataset, whatever the clocks of the instances;
 - atomicity: a failed upload (storage errors, invalid files, uploads interrupted in the middle of the write) or a failed
@@ -13,12 +17,18 @@ Invariants:
 - snapshot: a request keeps reading the content it started with until it ends, whatever is uploaded, removed or
   expired meanwhile on any instance;
 - read-only: the queries of the agent can neither modify the datasets nor open other files (ATTACH);
+- tenants: the datasets of another agent, even with the same chat ids and the same file manager, are never visible,
+  and destroying another agent never touches the datasets of this one;
+- Rabbit Hole: a dataset uploaded through the Rabbit Hole is queryable as soon as its description is ingested, and the
+  description of a dataset that could not be stored never reaches the memory;
 - local disk: with a remote file manager, nothing is written on the local disk of the instance;
 - replies: the reply contains every chart drawn by the agent (inline), the answer of the agent survives a failure of
-  the final LLM call, and the history never contains base64 images;
+  the final LLM call, the answer is stored once in the history (by the core) and the history never contains base64
+  images;
 - numbers: the numbers of a CSV file separated by ";" are read back unchanged, in European or in the usual format.
 """
 import contextlib
+from types import SimpleNamespace
 import os
 import tempfile
 import time
@@ -27,7 +37,9 @@ from pathlib import Path
 from unittest import mock
 
 m = support = None
-SCOPES = ("shared", "c1", "c2")
+#: "c1@u2" is the conversation c1 of the user u2; the other conversations are of the user u1
+SCOPES = ("shared", "c1", "c2", "c1@u2")
+CHATS = SCOPES[1:]
 NAMES = ("a.csv", "b.csv", "a.sqlite", "c.sqlite")
 
 
@@ -40,7 +52,8 @@ def setUpModule():
 
 def _hypothesis():
     # hypothesis keeps a cache in the working directory (the root of the core): use a temporary one
-    os.environ.setdefault("HYPOTHESIS_STORAGE_DIRECTORY", tempfile.mkdtemp(prefix="cwyd-hypothesis-"))
+    # the same folder at every run (a new one each time would be left behind)
+    os.environ.setdefault("HYPOTHESIS_STORAGE_DIRECTORY", os.path.join(tempfile.gettempdir(), "cat-plugins-hypothesis"))
     try:
         import hypothesis  # noqa: F401
     except ImportError:  # pragma: no cover - hypothesis is a test-only dependency
@@ -48,6 +61,11 @@ def _hypothesis():
     from hypothesis import HealthCheck, settings, strategies as st
     from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule, run_state_machine_as_test
     return HealthCheck, settings, st, RuleBasedStateMachine, invariant, precondition, rule, run_state_machine_as_test
+
+
+def chat_and_user(scope: str):
+    chat, _, user = scope.partition("@")
+    return chat, user or "u1"
 
 
 def content_of(name: str, rows) -> bytes:
@@ -76,8 +94,10 @@ def build_datasets_machine():
         def __init__(self):
             super().__init__()
             self.agent = f"agent-{time.monotonic_ns()}"
+            self.other = f"other:{time.monotonic_ns()}"  # another tenant, on the same file manager
             self.fm = m.fakes.ObjectStoreFileManager()
             self.model = {scope: {} for scope in SCOPES}  # scope -> {name: rows}
+            self.other_model = {scope: {} for scope in SCOPES}
             self.snapshots = []  # (engine, expected content) of the requests still running
             self.recent = set()  # conversations that uploaded or used their datasets since time last passed
             self.interrupted = set()  # (scope, name) with the copy of an interrupted upload
@@ -87,14 +107,17 @@ def build_datasets_machine():
             for patch in self.patches:
                 patch.start()
 
-        def store(self, scope):
-            return m.datasets.DatasetStore(self.fm, self.agent, None if scope == "shared" else scope)
+        def store(self, scope, agent=None):
+            if scope == "shared":
+                return m.datasets.DatasetStore(self.fm, agent or self.agent)
+            return m.datasets.DatasetStore(self.fm, agent or self.agent, *chat_and_user(scope))
 
         def visible(self, chat):
             return {**self.model["shared"], **self.model[chat]}
 
         def workspace_engine(self, chat):
-            cat = m.fakes.make_cat(agent_key=self.agent, chat_id=chat, file_manager=self.fm)
+            chat_id, user_id = chat_and_user(chat)
+            cat = m.fakes.make_cat(agent_key=self.agent, chat_id=chat_id, user_id=user_id, file_manager=self.fm)
             return m.query_agent.QueryCatAgent(cat)._uploaded_datasets_engine()
 
         # ------------------------------------------------------------------------------------------------------------
@@ -170,7 +193,63 @@ def build_datasets_machine():
             self.model[scope].pop(name, None)
             self.interrupted.discard((scope, name))
 
-        @rule(chat=st.sampled_from(("c1", "c2")))
+        @rule(scope=st.sampled_from(SCOPES), name=st.sampled_from(NAMES), rows=rows_strategy)
+        def other_tenant_uploads(self, scope, name, rows):
+            self.store(scope, self.other).add(name, content_of(name, rows), shared=scope == "shared")
+            self.other_model[scope][name] = rows
+
+        @rule(chat=st.sampled_from(["c1", "c2", "cat_with_your_data", "system", "_chats", "c1@u2"]))
+        def core_deletes_conversation(self, chat):
+            # as the core does (cat/core_plugins/conversation_history/endpoints.py): the folder of the conversation
+            # goes, for every user of the conversation (and so the snapshots of the requests running are unaffected)
+            chat_id = chat_and_user(chat)[0]
+            self.fm.remove_folder(f"{self.agent}/{chat_id}")
+            for scope in CHATS:
+                if chat_and_user(scope)[0] == chat_id:
+                    self.model[scope] = {}
+                    self.interrupted = {(s, n) for s, n in self.interrupted if s != scope}
+
+        @rule()
+        def other_tenant_is_destroyed(self):
+            # as the core does (CheshireCat.destroy): the folder of the agent, then the hooks
+            self.fm.remove_folder(self.other)
+            support.run(m.query_cat.after_cheshire_cat_destroy.function(self.other, SimpleNamespace(file_manager=self.fm)))
+            self.other_model = {scope: {} for scope in SCOPES}
+
+        @rule(scope=st.sampled_from(SCOPES), name=st.sampled_from(NAMES), rows=rows_strategy, fail=st.booleans())
+        def rabbit_hole_upload(self, scope, name, rows, fail):
+            from langchain_core.documents import Document
+            from cat import StrayCat
+
+            plugin = SimpleNamespace(load_settings=mock.AsyncMock(
+                return_value=support.default_settings(chat_datasets_ttl_hours=0)))
+            if scope == "shared":
+                cat = SimpleNamespace(agent_key=self.agent, file_manager=self.fm)
+            else:
+                cat = mock.MagicMock(spec=StrayCat)
+                chat_id, user_id = chat_and_user(scope)
+                cat.agent_key, cat.id, cat.file_manager = self.agent, chat_id, self.fm
+                cat.user = SimpleNamespace(id=user_id)
+                cat.notifier = SimpleNamespace(send_notification=mock.AsyncMock(), send_error=mock.AsyncMock())
+            cat.mad_hatter = SimpleNamespace(get_plugin=lambda: plugin)
+            docs = [Document(page_content=f"Dataset '{name}'", metadata={
+                m.parsers.KIND_KEY: "sqlite" if name.endswith(".sqlite") else "csv", m.parsers.NAME_KEY: name,
+                m.parsers.PAYLOAD_KEY: content_of(name, rows)})]
+            failing = mock.patch.object(self.fm, "_write_file", side_effect=OSError("storage down"))
+            with failing if fail else contextlib.nullcontext():
+                result = support.run(m.query_cat.before_rabbithole_splits_documents.function(docs, cat))
+            if fail:
+                assert result == [], "the description of a dataset not stored never reaches the memory"
+                if scope != "shared":
+                    cat.notifier.send_error.assert_awaited_once()
+                return
+            assert len(result) == 1 and "can be queried" in result[0].page_content
+            assert not {m.parsers.KIND_KEY, m.parsers.NAME_KEY, m.parsers.PAYLOAD_KEY} & set(result[0].metadata)
+            self.model[scope][name] = rows
+            self.recent.add(scope)
+            self.interrupted.discard((scope, name))
+
+        @rule(chat=st.sampled_from(CHATS))
         def open_request(self, chat):
             visible = self.visible(chat)
             engine = self.workspace_engine(chat)
@@ -196,7 +275,7 @@ def build_datasets_machine():
         @rule(scope=st.sampled_from(SCOPES))
         def cleanup(self, scope):
             self.store(scope).cleanup_expired(5)
-            for chat in ("c1", "c2"):
+            for chat in CHATS:
                 if chat in self.recent or chat == scope:
                     continue  # protected: the isolation invariant checks that nothing was removed
                 self.model[chat] = {}
@@ -204,18 +283,24 @@ def build_datasets_machine():
 
         # ------------------------------------------------------------------------------------------------------------
         @invariant()
+        def other_tenant_is_isolated(self):
+            for chat in CHATS:
+                listed = {d.name for d in self.store(chat, self.other).list_datasets()}
+                assert listed == set(self.other_model["shared"]) | set(self.other_model[chat]), (chat, listed)
+
+        @invariant()
         def isolation(self):
-            for chat in ("c1", "c2"):
-                listed = {d.name: d.scope for d in m.datasets.DatasetStore(self.fm, self.agent, chat).list_datasets()}
+            for chat in CHATS:
+                listed = {d.name: d.scope for d in self.store(chat).list_datasets()}
                 expected = {name: "shared" for name in self.model["shared"]}
                 expected.update({name: "chat" for name in self.model[chat]})
                 assert listed == expected, (chat, listed, expected)
 
         @invariant()
         def freshness_and_read_only(self):
-            for chat in ("c1", "c2"):
+            for chat in CHATS:
                 visible = self.visible(chat)
-                store = m.datasets.DatasetStore(self.fm, self.agent, chat)
+                store = self.store(chat)
                 workspace = store.workspace()
                 if not visible:
                     assert workspace is None
@@ -255,9 +340,8 @@ def build_replies_machine():
     class RepliesMachine(RuleBasedStateMachine):
         def __init__(self):
             super().__init__()
-            tmp = Path(tempfile.mkdtemp())
-            self.csv = tmp / "sales.csv"
-            self.csv.write_text("region,amount\nN,1\nS,2\nE,3\n")
+            self.agent = f"agent-replies-{time.monotonic_ns()}"
+            support.put_file(self.agent, "sales.csv", b"region,amount\nN,1\nS,2\nE,3\n")
             self.history = []
 
         @rule(charts=st.integers(0, 4), answer=st.sampled_from(["", "N leads", "braces {x}"]),
@@ -278,9 +362,16 @@ def build_replies_machine():
                 "ok": f.Workflow(output="final text"), "empty": f.Workflow(output=""),
                 "llm-error": f.Workflow(output="x", with_llm_error=True), "exception": f.Workflow(error=RuntimeError("down")),
             }[final]
-            settings_ = support.default_settings(ds_type="CSV", host=str(self.csv))
-            cat = f.make_cat(llm, settings_, workflow=workflow, history=self.history, agent_key="agent-replies")
+            settings_ = support.default_settings(ds_type="CSV", host="sales.csv")
+            cat = f.make_cat(llm, settings_, workflow=workflow, history=self.history, agent_key=self.agent)
+            before = len(cat.working_memory.history)
             output = support.run(m.query_cat.agent_fast_reply.function(cat))
+            assert len(cat.working_memory.history) == before, "the plugin never stores the answer itself"
+            if output is not None:
+                # the core runs the hooks of the turn on the answer (the conversation history stores it)
+                sent = support.core_sends(cat, output)
+                assert sent.text == output.output, "the user gets the charts"
+                assert len(cat.working_memory.history) == before + 1, "the answer is stored once"
             self.history = cat.working_memory.history
 
             drawn = min(charts, m.chart_tool.MAX_CHARTS_PER_ANSWER)

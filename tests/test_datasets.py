@@ -27,12 +27,24 @@ def query(workspace: bytes, sql: str):
 
 
 class NamesTest(unittest.TestCase):
-    def test_safe_segment(self):
-        safe = m.datasets._safe_segment
-        self.assertEqual(safe("agent-1.x_y"), "agent-1.x_y")
-        for dangerous in ("..", ".", "a/b", "../x", "", "a" * 200, "x\x00"):
-            segment = safe(dangerous)
-            self.assertRegex(segment, r"^[a-f0-9]{32}$")
+    def test_encoded_ids(self):
+        encoded = m.datasets.encoded
+        self.assertEqual(encoded("agent-1_x"), "agent-1_x")
+        for value in ("..", ".", "a/b", "../x", "a\\b", "x+y", "%2F"):
+            name = encoded(value)
+            self.assertNotIn("/", name)
+            self.assertNotIn("+", name)
+            self.assertNotIn(name, (".", ".."))
+            self.assertEqual(m.datasets.decoded(name), value)
+        self.assertEqual(encoded(None), "")
+        self.assertNotEqual(encoded("a/b"), encoded("a%2Fb"))
+
+    def test_folder_names(self):
+        is_folder = m.datasets.is_folder_name
+        self.assertTrue(is_folder("chat-1"))
+        self.assertTrue(is_folder("a b.c"))
+        for value in ("", None, ".", "..", "a/b", "a\\b", "/abs"):
+            self.assertFalse(is_folder(value), value)
 
     def test_sanitize_filename(self):
         sanitize = m.datasets.sanitize_filename
@@ -161,8 +173,8 @@ class StoreTest(unittest.TestCase):
         self.agent = f"agent-{time.monotonic_ns()}"
         self.fm = self.file_manager()
 
-    def store(self, chat="chat"):
-        return m.datasets.DatasetStore(self.fm, self.agent, chat)
+    def store(self, chat="chat", user="u1"):
+        return m.datasets.DatasetStore(self.fm, self.agent, chat, user)
 
     def shared(self):
         return m.datasets.DatasetStore(self.fm, self.agent)
@@ -194,10 +206,13 @@ class StoreTest(unittest.TestCase):
         store.add("x.csv", b"a\n1\n")
         stored, = self.stored_names(store.chat_dir)
         self.assertRegex(stored, r"^\d{20}-[0-9a-f]{16}--x\.csv$")
-        # the folder of the conversation is the one of the core, removed with the conversation
-        self.assertEqual(store.chat_dir, f"{self.agent}/chat/cat_with_your_data")
-        self.assertEqual(self.stored_names(store.index_dir), ["chat"])
-        self.assertEqual(m.datasets.DatasetStore(self.fm, self.agent, "a/../b").chat_dir.count("/"), 2)
+        # the folder of the conversation is the one of the core, removed with the conversation; every user has its own
+        self.assertEqual(store.chat_dir, f"{self.agent}/chat/cat_with_your_data/u1")
+        self.assertEqual(self.stored_names(store.index_dir), ["chat+u1"])
+        self.assertEqual(self.store(user="a/../b").chat_dir, f"{self.agent}/chat/cat_with_your_data/a%2F%2E%2E%2Fb")
+        # the shared datasets are outside the folder of the agent (every folder there may be one of a conversation)
+        self.assertEqual(self.shared().shared_dir, f"system/cat_with_your_data/{self.agent}")
+        self.assertEqual(m.datasets.DatasetStore(self.fm, "a/../b").shared_dir, "system/cat_with_your_data/a%2F%2E%2E%2Fb")
 
     def test_file_manager_errors(self):
         store = self.store()
@@ -205,7 +220,7 @@ class StoreTest(unittest.TestCase):
             with self.assertRaises(m.datasets.DatasetError):
                 store.add("x.csv", b"a\n1\n")
         # the default file manager of the core (Dummy) accepts the writes and keeps nothing
-        dummy = m.datasets.DatasetStore(m.fakes.DummyFileManager(), self.agent, "chat")
+        dummy = m.datasets.DatasetStore(m.fakes.DummyFileManager(), self.agent, "chat", "u1")
         with self.assertRaises(m.datasets.DatasetError) as error:
             dummy.add("x.csv", b"a\n1\n")
         self.assertIn("configure a file manager", str(error.exception))
@@ -318,7 +333,7 @@ class StoreTest(unittest.TestCase):
 
         current.cleanup_expired(1)
         self.assertEqual([d.name for d in old.list_datasets()], ["s.csv"])
-        self.assertNotIn("old", self.stored_names(old.index_dir))
+        self.assertNotIn("old+u1", self.stored_names(old.index_dir))
         self.assertEqual({d.name for d in current.list_datasets()}, {"s.csv", "y.csv"}, "the current one is kept")
         self.assertEqual({d.name for d in recent.list_datasets()}, {"s.csv", "z.csv"})
 
@@ -352,12 +367,20 @@ class StoreTest(unittest.TestCase):
             self.store("other").cleanup_expired(1)  # logged
         self.assertEqual([d.name for d in store.list_datasets()], ["x.csv"])
         # markers removed meanwhile, or being written (on another instance)
-        self.fm.write_file("not a number", "old", store.index_dir)
+        self.fm.write_file("not a number", "old+u1", store.index_dir)
         self.store("other").cleanup_expired(1)
         self.assertEqual([d.name for d in store.list_datasets()], ["x.csv"])
         with mock.patch.object(self.fm, "download_file", return_value=None):
             self.store("other").cleanup_expired(1)
         self.assertEqual([d.name for d in store.list_datasets()], ["x.csv"])
+
+    def test_markers_without_a_conversation_folder_are_only_removed(self):
+        # markers of the previous versions of the plugin (no user), or of ids that are not folder names
+        store = self.store()
+        for marker in ("legacy", f"{m.datasets.encoded('a/b')}+u1"):
+            self.fm.write_file(f"{time.time() - 10 * 3600:020.6f}", marker, store.index_dir)
+        store.cleanup_expired(1)
+        self.assertEqual(set(self.stored_names(store.index_dir)) & {"legacy", "a%2Fb+u1"}, set())
 
     def test_incomplete_copies(self):
         # regression: an incomplete copy was waited for, by its timestamp; the timestamp may be ahead of the clock

@@ -22,17 +22,22 @@ def setUpModule():
 
 class AgentTestCase(unittest.TestCase):
     def store(self, chat="chat-1"):
-        return m.datasets.DatasetStore(m.file_manager, self.agent_key, chat)
+        return m.datasets.DatasetStore(m.file_manager, self.agent_key, chat, "user-1")
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.csv = self.tmp / "sales.csv"
-        self.csv.write_text("region;amount\nNorth;1.200,5\nSouth;300\nNorth;50\n")
+        self.tmp = support.temporary_folder(self)
         self.agent_key = f"agent-{time.monotonic_ns()}"
+        # the configured file datasources are in the file manager of the agent (e.g. uploaded in its memory)
+        self.csv = self.put("sales.csv", b"region;amount\nNorth;1.200,5\nSouth;300\nNorth;50\n")
+
+    def put(self, path, content, file_manager=None):
+        folder, _, name = f"{self.agent_key}/{path}".rpartition("/")
+        (file_manager or m.file_manager).write_file(content, name, folder)
+        return path
 
     def cat(self, llm, settings=None, **kwargs):
         kwargs.setdefault("agent_key", self.agent_key)
-        return f.make_cat(llm, settings if settings is not None else support.default_settings(ds_type="CSV", host=str(self.csv)), **kwargs)
+        return f.make_cat(llm, settings if settings is not None else support.default_settings(ds_type="CSV", host=self.csv), **kwargs)
 
     def run_agent(self, cat):
         return support.run(m.query_agent.QueryCatAgent(cat).run())
@@ -69,13 +74,13 @@ class DatasourceTest(AgentTestCase):
 
     def test_charts_disabled(self):
         llm = f.ScriptedChatModel(script=[f.AIMessage(content="ok")])
-        result = self.run_agent(self.cat(llm, support.default_settings(ds_type="CSV", host=str(self.csv), charts="disabled")))
+        result = self.run_agent(self.cat(llm, support.default_settings(ds_type="CSV", host=self.csv, charts="disabled")))
         self.assertEqual((result.thought, result.chart_markdown), ("ok", None))
         self.assertNotIn("draw_chart", llm.prompts[0][0].content)
 
     def test_configured_sqlite_and_uploaded_datasets(self):
-        db = support.sqlite_file(self.tmp / "conf.sqlite", {"conf": (["v"], [(1,)])})
-        settings = support.default_settings(ds_type="SQLite", host=str(db))
+        db = self.put("dbs/conf.sqlite", support.sqlite_bytes({"conf": (["v"], [(1,)])}))
+        settings = support.default_settings(ds_type="SQLite", host=db)
         llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_list_tables", {"tool_input": ""}), f.AIMessage(content="a")])
         self.run_agent(self.cat(llm, settings))
         self.assertIn("conf", str(llm.prompts[-1][-1].content))
@@ -126,29 +131,50 @@ class DatasourceTest(AgentTestCase):
         self.assertEqual(llm.prompts[-1][-1].content, "sales")  # the configured CSV, not the uploaded dataset
 
     def test_tabular_json(self):
-        path = self.tmp / "orders.json"
-        path.write_text(json.dumps({"orders": [{"id": 1, "total": 10}, {"id": 2, "total": 5}]}))
+        path = self.put("orders.json", json.dumps({"orders": [{"id": 1, "total": 10}, {"id": 2, "total": 5}]}).encode())
         llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_query", {"query": "SELECT SUM(total) FROM orders"}), f.AIMessage(content="15")])
-        self.assertEqual(self.run_agent(self.cat(llm, support.default_settings(ds_type="JSON", host=str(path)))).answer, "15")
+        self.assertEqual(self.run_agent(self.cat(llm, support.default_settings(ds_type="JSON", host=path))).answer, "15")
         self.assertIn("[(15,)]", llm.prompts[-1][-1].content)
 
     def test_non_tabular_json_uses_the_json_agent(self):
-        path = self.tmp / "conf.json"
-        path.write_text(json.dumps({"config": {"name": "cat"}}))
+        path = self.put("conf.json", json.dumps({"config": {"name": "cat"}}).encode())
         llm = f.ReactChatModel(script=[f.react_step("json_spec_list_keys", "data"), f.react_final("the key is config")])
-        result = self.run_agent(self.cat(llm, support.default_settings(ds_type="JSON", host=str(path))))
+        result = self.run_agent(self.cat(llm, support.default_settings(ds_type="JSON", host=path)))
         self.assertEqual((result.thought, result.answer, result.chart_markdown), ("the key is config", "the key is config", None))
 
+    def test_json_agent_cannot_be_created(self):
+        path = self.put("conf2.json", json.dumps({"config": {"name": "cat"}}).encode())
+        with mock.patch.object(m.query_agent, "create_json_agent", side_effect=RuntimeError("no agent")):
+            self.assertIsNone(self.run_agent(self.cat(f.ReactChatModel(script=[]), support.default_settings(ds_type="JSON", host=path))))
+
+    def test_file_datasources_on_the_local_file_manager_of_the_core(self):
+        # the local file manager gives the hash of the files: the content is downloaded only to build the engine
+        fm = f.local_file_manager()
+        self.put("sales.csv", b"region;amount\nNorth;1\n", fm)
+        llm = f.ScriptedChatModel(script=[f.tool_call("sql_db_list_tables", {"tool_input": ""}), f.AIMessage(content="ok")])
+        self.assertEqual(self.run_agent(self.cat(llm, file_manager=fm)).answer, "ok")
+        with mock.patch.object(fm, "download_file", side_effect=AssertionError("downloaded")):
+            llm = f.ScriptedChatModel(script=[f.AIMessage(content="cached")])
+            self.assertEqual(self.run_agent(self.cat(llm, file_manager=fm)).answer, "cached")
+        # listed but not readable (e.g. removed meanwhile)
+        self.put("gone.csv", b"a\n1\n", fm)
+        with mock.patch.object(fm, "download_file", return_value=None):
+            self.assertIsNone(self.run_agent(self.cat(f.ScriptedChatModel(script=[]), support.default_settings(
+                ds_type="CSV", host="gone.csv"), file_manager=fm)))
+
     def test_unreadable_json(self):
-        path = self.tmp / "bad.json"
-        path.write_text("{not json")
-        self.assertIsNone(self.run_agent(self.cat(f.ReactChatModel(script=[]), support.default_settings(ds_type="JSON", host=str(path)))))
+        path = self.put("bad.json", b"{not json")
+        self.assertIsNone(self.run_agent(self.cat(f.ReactChatModel(script=[]), support.default_settings(ds_type="JSON", host=path))))
 
     def test_invalid_datasources(self):
-        for settings in (support.default_settings(ds_type="CSV", host=str(self.tmp / "missing.csv")),
+        self.put("../outside.csv", b"a\n1\n")  # a file of another folder
+        for settings in (support.default_settings(ds_type="CSV", host="missing.csv"),
+                         support.default_settings(ds_type="CSV", host="../outside.csv"),
+                         support.default_settings(ds_type="CSV", host=str(self.tmp / "local.csv")),
+                         support.default_settings(ds_type="SQLite", host=""),
                          support.default_settings(ds_type="Unknown"),
                          support.default_settings(ds_type="")):
-            with self.subTest(settings=settings["ds_type"]):
+            with self.subTest(settings=(settings["ds_type"], settings["host"])):
                 self.assertIsNone(self.run_agent(self.cat(f.ScriptedChatModel(script=[]), settings)))
 
     def test_sql_connection_string(self):
@@ -258,18 +284,6 @@ class FinalOutputTest(AgentTestCase):
         agent.settings = support.default_settings(input_prompt="")
         agent.cat.working_memory.history = []
         self.assertEqual(agent._get_agent_input(), "as a pie")
-
-    def test_save_answer_in_history(self):
-        agent, _ = self.agent()
-        chart = m.charts.chart_markdown_inline(b"png", "C")
-        support.run(agent.save_answer_in_history(f"text\n\n{chart}"))
-        self.assertEqual(agent.cat.working_memory.history[-1].content.text, "text\n\n[chart: C]")
-
-        async def broken(**kwargs):
-            raise RuntimeError("redis down")
-
-        agent.cat.working_memory.update_history = broken
-        support.run(agent.save_answer_in_history("text"))  # logged, not raised
 
 
 if __name__ == "__main__":

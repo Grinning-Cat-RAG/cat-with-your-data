@@ -29,7 +29,9 @@ def load() -> SimpleNamespace:
         return modules
 
     warnings.filterwarnings("ignore")
-    modules.data_root = Path(tempfile.mkdtemp(prefix="cwyd-tests-"))
+    # removed when the interpreter exits
+    modules.data_folder = tempfile.TemporaryDirectory(prefix="cwyd-tests-")
+    modules.data_root = Path(modules.data_folder.name)
     modules.plugin = load_plugin()
     for name in ("settings", "crypt", "datasets", "data_engine", "charts", "chart_tool", "parsers", "query_agent",
                  "query_cat", "endpoints"):
@@ -60,6 +62,13 @@ def load_plugin(order=None):
     return plugin
 
 
+def temporary_folder(test) -> Path:
+    """A temporary folder removed at the end of the test."""
+    folder = tempfile.TemporaryDirectory(prefix="cwyd-test-")
+    test.addCleanup(folder.cleanup)
+    return Path(folder.name)
+
+
 def run(coroutine):
     return asyncio.run(coroutine)
 
@@ -84,6 +93,38 @@ def sqlite_file(path: Path, tables: dict) -> Path:
 def sqlite_bytes(tables: dict) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         return sqlite_file(Path(tmp) / "db.sqlite", tables).read_bytes()
+
+
+def configured_file(name: str, content: bytes):
+    """A file datasource with the given content (its version is the content)."""
+    import hashlib
+
+    return modules.datasets.ConfiguredFile(name, f"test::{name}::{hashlib.sha256(content).hexdigest()}", lambda: content)
+
+
+def put_file(agent_key: str, path: str, content: bytes, file_manager=None) -> str:
+    """Store a file in the folder of the agent, in the file manager (e.g. a file uploaded in the memory of the agent)."""
+    folder, _, name = f"{agent_key}/{path}".rpartition("/")
+    (file_manager or modules.file_manager).write_file(content, name, folder)
+    return path
+
+
+def core_sends(cat, output):
+    """What the core does with the answer of an ``agent_fast_reply`` hook: the conversation history stores it (unless
+    the LLM failed), then the hook of the plugin runs; the history saved in the database is in ``cat.state``."""
+    from unittest import mock
+
+    from cat import CatMessage
+
+    message = CatMessage(text=output.output)
+    if not output.with_llm_error:
+        run(cat.working_memory.update_history(who="assistant", content=message))
+
+    async def set_messages(agent_id, user_id, chat_id, history):
+        cat.state["saved_history"] = [(item.who, item.content.text) for item in history]
+
+    with mock.patch.object(modules.query_cat.crud_conversations, "set_messages", set_messages):
+        return run(modules.query_cat.before_cat_sends_message.function(message, output, cat))
 
 
 def default_settings(**overrides) -> dict:
@@ -216,13 +257,14 @@ def _build_fakes() -> SimpleNamespace:
             return AgenticWorkflowOutput(output=text, with_llm_error=self.with_llm_error)
 
     def make_cat(llm=None, settings=None, user_message="question", chat_id="chat-1", agent_key="agent-1",
-                 history=None, workflow=None, notifier=None, file_manager=None):
+                 history=None, workflow=None, notifier=None, file_manager=None, user_id="user-1"):
         working_memory = SimpleNamespace(
             user_message=SimpleNamespace(text=user_message), history=list(history or []),
         )
 
         async def update_history(who, content):
-            working_memory.history.append(SimpleNamespace(who=who, content=content))
+            # the core stores a copy of the message
+            working_memory.history.append(SimpleNamespace(who=who, content=SimpleNamespace(text=content.text)))
 
         working_memory.update_history = update_history
         state = {"settings": dict(settings if settings is not None else default_settings())}
@@ -241,6 +283,7 @@ def _build_fakes() -> SimpleNamespace:
         return SimpleNamespace(
             large_language_model=llm, agentic_workflow=workflow or Workflow(), mad_hatter=manager,
             plugin_manager=manager, working_memory=working_memory, agent_key=agent_key, id=chat_id,
+            user=SimpleNamespace(id=user_id),
             notifier=notifier, state=state, file_manager=file_manager or modules.file_manager,
         )
 

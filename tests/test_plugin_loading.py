@@ -22,7 +22,8 @@ class PluginLoadingTest(unittest.TestCase):
         plugin = m.plugin  # loaded by the core loader in support.load()
         self.assertEqual(
             sorted((h.name, h.priority) for h in plugin.hooks),
-            [("agent_fast_reply", 0), ("before_rabbithole_splits_documents", 10), ("rabbithole_instantiates_parsers", 1)],
+            [("after_cheshire_cat_destroy", 1), ("agent_fast_reply", 0), ("before_cat_sends_message", 0),
+             ("before_rabbithole_splits_documents", 10), ("rabbithole_instantiates_parsers", 1)],
         )
         self.assertEqual(
             sorted((e.name, tuple(sorted(e.methods))) for e in plugin.endpoints),

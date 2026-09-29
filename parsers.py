@@ -12,8 +12,7 @@ from langchain_core.documents.base import Blob, Document
 
 from cat import log
 
-# the core loader imports and then reloads the plugin modules one by one, in no particular order: the classes of
-# `datasets` are looked up at call time, so that `except` and patches always see the current ones
+# sibling modules are looked up at call time
 from . import datasets
 
 PAYLOAD_KEY = "cat_with_your_data_payload"

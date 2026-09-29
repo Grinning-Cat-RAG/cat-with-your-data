@@ -2,8 +2,8 @@
 
 Datasets (CSV / SQLite) can be uploaded on the fly:
 
-- with ``chat_id`` (query parameter or ``X-Chat-ID`` header) the dataset is visible only in that conversation and
-  the CHAT/WRITE permission is enough;
+- with ``chat_id`` (query parameter or ``X-Chat-ID`` header) the dataset is visible only to the user, in that
+  conversation, and the CHAT/WRITE permission is enough;
 - without ``chat_id`` the dataset is shared by every conversation of the agent and the UPLOAD/WRITE permission is
   required.
 """
@@ -17,8 +17,7 @@ from cat import AuthorizedInfo, AuthPermission, AuthResource, check_permissions,
 from cat.exceptions import CustomForbiddenException, CustomNotFoundException, CustomValidationException
 from cat.routes.routes_utils import has_write_permission
 
-# the core loader imports and then reloads the plugin modules one by one, in no particular order: the classes of
-# `datasets` are looked up at call time, so that `except` and patches always see the current ones
+# sibling modules are looked up at call time
 from . import datasets
 
 TAGS = ["Cat With Your Data"]
@@ -46,7 +45,7 @@ def _store(info: AuthorizedInfo) -> datasets.DatasetStore:
     if info.cheshire_cat is None:
         raise CustomValidationException("The agent is required (X-Agent-ID header or agent_id query parameter)")
     chat_id = info.stray_cat.id if info.stray_cat else None
-    return datasets.DatasetStore(info.cheshire_cat.file_manager, info.cheshire_cat.agent_key, chat_id)
+    return datasets.DatasetStore(info.cheshire_cat.file_manager, info.cheshire_cat.agent_key, chat_id, info.user.id)
 
 
 def _check_shared_permission(info: AuthorizedInfo) -> None:
@@ -106,7 +105,10 @@ async def delete_dataset(
     store = _store(info)
     _check_shared_permission(info)
 
-    deleted = await asyncio.to_thread(store.remove, name, info.stray_cat is None)
+    try:
+        deleted = await asyncio.to_thread(store.remove, name, info.stray_cat is None)
+    except datasets.DatasetError as e:
+        raise CustomValidationException(str(e)) from e
     if not deleted:
         raise CustomNotFoundException("Dataset not found")
     return DatasetDeleteResponse(deleted=True)

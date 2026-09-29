@@ -6,16 +6,17 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 import pandas as pd
+import sqlglot
 from langchain_community.utilities import SQLDatabase
+from sqlglot import exp
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.pool import NullPool, StaticPool
 
-# the core loader reloads the plugin modules in no particular order: the classes of `datasets` are looked up at call time
+# sibling modules are looked up at call time
 from . import datasets
 from .datasets import read_csv, table_name_from
 
@@ -98,8 +99,9 @@ def _mysql_read_only(dbapi_connection, _connection_record):
 def engine_from_uri(uri: str) -> Engine:
     """Engine for a SQLAlchemy URL (configured SQL datasources); engines are cached to reuse the pools.
 
-    The sessions are read-only where the database allows it (PostgreSQL, MySQL, SQLite); the agent cannot change it,
-    since only SELECT statements are accepted. For the other databases, use a user with read-only privileges.
+    The sessions are read-only where the database allows it (PostgreSQL, MySQL) and the statements of the agent are
+    checked (a single read-only SELECT, see ``validate_read_only``); only a database user with read-only privileges
+    guarantees that nothing can be changed: configure one.
     """
     def factory():
         backend = make_url(uri).get_backend_name()
@@ -107,8 +109,6 @@ def engine_from_uri(uri: str) -> Engine:
         engine = create_engine(uri, pool_pre_ping=True, **kwargs)
         if backend == "mysql":
             event.listen(engine, "connect", _mysql_read_only)
-        if backend == "sqlite":
-            _harden_sqlite(engine)
         return engine, engine.dispose
 
     return _cached(f"uri::{uri}", factory)
@@ -161,17 +161,11 @@ def _memory_engine(frames: Dict[str, pd.DataFrame]) -> Tuple[Engine, Callable[[]
     return engine, release
 
 
-def _file_key(prefix: str, path: Path) -> str:
-    stat = path.stat()
-    return f"{prefix}::{path.resolve()}::{stat.st_size}::{stat.st_mtime_ns}::{stat.st_ino}"
-
-
-def engine_from_csv(path: str) -> Engine:
-    """In-memory SQLite engine holding the content of a CSV file (one table, named after the file)."""
-    file_path = Path(path)
+def engine_from_csv(file: "datasets.ConfiguredFile") -> Engine:
+    """In-memory SQLite engine holding the content of a CSV file (one table, named after the file); cached by version."""
     return _cached(
-        _file_key("csv", file_path),
-        lambda: _memory_engine({table_name_from(file_path.name): read_csv(file_path)}),
+        f"csv::{file.version}",
+        lambda: _memory_engine({table_name_from(file.name): read_csv(file.load(), file.name)}),
     )
 
 
@@ -192,14 +186,18 @@ def json_to_frames(data) -> Dict[str, pd.DataFrame]:
     return {}
 
 
-def engine_from_json(path: str) -> Engine | None:
-    """In-memory SQLite engine for tabular JSON files; None when the JSON cannot be represented as tables."""
-    file_path = Path(path)
-    key = _file_key("json", file_path)
+def read_json(file: "datasets.ConfiguredFile"):
+    return json.loads(file.load().decode("utf-8-sig"))
+
+
+def engine_from_json(file: "datasets.ConfiguredFile") -> Engine | None:
+    """In-memory SQLite engine for tabular JSON files, cached by version; None when the JSON cannot be represented as
+    tables."""
+    key = f"json::{file.version}"
     if (engine := _get_cached(key)) is not None:
         return engine
 
-    frames = json_to_frames(json.loads(file_path.read_text(encoding="utf-8")))
+    frames = json_to_frames(read_json(file))
     if not frames:
         return None
     for name, df in frames.items():
@@ -216,6 +214,9 @@ _FORBIDDEN_KEYWORDS = re.compile(
     r"reindex|call|exec|execute|into|load_extension|outfile|dumpfile)\b",
     re.IGNORECASE,
 )
+
+
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 
 
 def _strip_literals(sql: str) -> str:
@@ -235,25 +236,86 @@ def clean_sql(sql: str) -> str:
     return sql.rstrip(";").strip()
 
 
-def validate_read_only(sql: str) -> str:
-    """Return the cleaned statement, raising ValueError if it is not a single read-only SELECT."""
+#: SQLAlchemy dialect -> sqlglot dialect
+_SQLGLOT_DIALECTS = {"postgresql": "postgres", "mysql": "mysql", "mariadb": "mysql", "oracle": "oracle",
+                     "mssql": "tsql", "sqlite": "sqlite"}
+
+#: functions acting outside the data, even in a SELECT: waits, locks, files of the server, other servers, sequences,
+#: settings, extensions
+_FORBIDDEN_FUNCTIONS = {
+    "pg_sleep", "pg_sleep_for", "pg_sleep_until", "pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file",
+    "pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile", "pg_advisory_lock",
+    "pg_advisory_xact_lock", "pg_try_advisory_lock", "pg_try_advisory_xact_lock", "lo_import", "lo_export", "lo_get",
+    "lo_put", "lo_from_bytea", "dblink", "dblink_exec", "dblink_connect", "dblink_send_query", "set_config", "nextval",
+    "setval", "txid_current", "query_to_xml", "query_to_xml_and_xmlschema", "cursor_to_xml",
+    "load_file", "sleep", "benchmark", "get_lock", "release_lock", "release_all_locks", "master_pos_wait",
+    "source_pos_wait", "load_extension", "readfile", "writefile", "edit", "fts3_tokenizer",
+    "openrowset", "openquery", "opendatasource", "openxml",
+}
+#: packages and procedures of Oracle and SQL Server reaching the network, the files or the server
+_FORBIDDEN_PREFIXES = ("dbms_", "utl_", "xp_", "sp_", "sys.dbms_", "sys.utl_")
+
+
+def _sqlglot_dialect(dialect: str | None) -> str | None:
+    return _SQLGLOT_DIALECTS.get((dialect or "").lower())
+
+
+def _check_statement(sql: str, dialect: str | None) -> None:
+    """ValueError unless the statement, read as the database of the datasource reads it, is a single query without
+    side effects."""
+    try:
+        statements = [s for s in sqlglot.parse(sql, read=_sqlglot_dialect(dialect)) if s is not None]
+    except sqlglot.errors.SqlglotError as e:
+        raise ValueError(f"The statement cannot be read: {e}") from e
+    if len(statements) != 1:
+        raise ValueError("Only a single SQL statement is allowed.")
+    statement, = statements
+    if not isinstance(statement, exp.Query):
+        raise ValueError("Only SELECT statements are allowed.")
+    for node in statement.walk():
+        if isinstance(node, (exp.DML, exp.DDL, exp.Command, exp.Into, exp.Lock, exp.Set, exp.Pragma, exp.Transaction)):
+            raise ValueError(f"'{node.key.upper()}' is not allowed in a read-only query.")
+        names = []
+        if isinstance(node, exp.Func):
+            names.append(node.name if isinstance(node, exp.Anonymous) else node.sql_name())
+        if isinstance(node, (exp.Identifier, exp.Dot)):
+            names.append(node.name if isinstance(node, exp.Identifier) else node.sql(dialect=_sqlglot_dialect(dialect)))
+        for name in (n.lower() for n in names if n):
+            if name in _FORBIDDEN_FUNCTIONS or name.startswith(_FORBIDDEN_PREFIXES):
+                raise ValueError(f"'{name}' is not allowed in a read-only query.")
+
+
+def validate_read_only(sql: str, dialect: str | None = None) -> str:
+    """Return the cleaned statement, raising ValueError if it is not a single read-only SELECT without side effects.
+
+    ``dialect`` is the one of the database (SQLAlchemy name, e.g. ``postgresql``): the statement is parsed as that
+    database reads it. The checks cannot foresee every function of every database: only a database user with read-only
+    privileges guarantees that nothing can be changed.
+    """
     sql = clean_sql(sql)
     if not sql:
         raise ValueError("Empty SQL statement.")
 
+    # quoting that the databases read differently (PostgreSQL dollar quoting, backslash escapes of MySQL and of
+    # PostgreSQL E'' strings): a literal here could be statements there
+    if _DOLLAR_QUOTE.search(sql) or "\\" in sql:
+        raise ValueError("Dollar quoting and backslashes are not allowed.")
     bare = _strip_literals(sql)
+    if "#" in bare:
+        raise ValueError("Comments starting with # are not allowed.")
     if ";" in bare:
         raise ValueError("Only a single SQL statement is allowed.")
     if not re.match(r"^\s*(select|with)\b", bare, re.IGNORECASE):
         raise ValueError("Only SELECT statements are allowed.")
     if match := _FORBIDDEN_KEYWORDS.search(bare):
         raise ValueError(f"Keyword '{match.group(1).upper()}' is not allowed in a read-only query.")
+    _check_statement(sql, dialect)
     return sql
 
 
 def run_select(engine: Engine, sql: str, max_rows: int) -> Tuple[pd.DataFrame, bool]:
     """Run a read-only SELECT and return (dataframe, truncated). The transaction is always rolled back."""
-    sql = validate_read_only(sql)
+    sql = validate_read_only(sql, engine.dialect.name)
     with engine.connect() as conn:
         try:
             # no parameters: the drivers with the "pyformat" style (psycopg2, mysql-connector, pymssql) would

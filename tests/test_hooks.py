@@ -21,14 +21,18 @@ def setUpModule():
 
 class FastReplyTest(unittest.TestCase):
     def setUp(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.csv = tmp / "sales.csv"
-        self.csv.write_text("region,amount\nN,1\nS,2\n")
-        self.settings = support.default_settings(ds_type="CSV", host=str(self.csv))
+        self.agent_key = f"a-{time.monotonic_ns()}"
+        support.put_file(self.agent_key, "sales.csv", b"region,amount\nN,1\nS,2\n")
+        self.settings = support.default_settings(ds_type="CSV", host="sales.csv")
 
     def reply(self, llm, workflow=None, settings=None):
-        cat = f.make_cat(llm, settings or self.settings, workflow=workflow or f.Workflow(), agent_key=f"a-{time.monotonic_ns()}")
-        return support.run(m.query_cat.agent_fast_reply.function(cat)), cat
+        cat = f.make_cat(llm, settings or self.settings, workflow=workflow or f.Workflow(), agent_key=self.agent_key)
+        output = support.run(m.query_cat.agent_fast_reply.function(cat))
+        if output is not None:
+            # the answer goes through the hooks of the core, as the ones of the agent
+            sent = support.core_sends(cat, output)
+            self.assertEqual(sent.text, output.output, "the user gets the charts")
+        return output, cat
 
     def chart_llm(self, answer="N and S"):
         return f.ScriptedChatModel(script=[f.tool_call("draw_chart", CHART), f.AIMessage(content=answer)])
@@ -38,6 +42,8 @@ class FastReplyTest(unittest.TestCase):
         self.assertTrue(output.output.startswith("Here it is\n\n![T](data:image/png;base64,"))
         # regression: the base64 chart was saved in the history, which the core sends to the LLM
         self.assertEqual(cat.working_memory.history[-1].content.text, "Here it is\n\n[chart: T]")
+        self.assertEqual(cat.state["saved_history"], [("assistant", "Here it is\n\n[chart: T]")])
+        self.assertEqual(len(cat.working_memory.history), 1, "the answer is stored once (by the core)")
 
     def test_final_llm_failure_returns_the_agent_answer(self):
         # regression: an exception of the final LLM call lost both the answer and the chart
@@ -121,6 +127,7 @@ class SplitDocumentsTest(unittest.TestCase):
         cat = mock.MagicMock(spec=StrayCat)
         cat.agent_key = f"agent-{time.monotonic_ns()}"
         cat.id = "chat-9"
+        cat.user = SimpleNamespace(id="user-9")
         plugin = SimpleNamespace(load_settings=mock.AsyncMock(return_value=support.default_settings()))
         cat.mad_hatter = SimpleNamespace(get_plugin=lambda: plugin)
         cat.notifier = notifier or SimpleNamespace(send_notification=mock.AsyncMock())
@@ -140,7 +147,7 @@ class SplitDocumentsTest(unittest.TestCase):
         self.assertEqual(docs[0].metadata, {})
         self.assertIn("can be queried in this conversation (tables: sales)", docs[0].page_content)
         cat.notifier.send_notification.assert_awaited_once()
-        store = m.datasets.DatasetStore(m.file_manager, cat.agent_key, "chat-9")
+        store = m.datasets.DatasetStore(m.file_manager, cat.agent_key, "chat-9", "user-9")
         self.assertEqual([d.name for d in store.list_datasets()], ["sales.csv"])
 
     def test_agent_dataset_without_chat(self):
@@ -159,14 +166,15 @@ class SplitDocumentsTest(unittest.TestCase):
             docs = self.split(self.docs(self.dataset_doc("a.csv"), self.dataset_doc("b.csv"), self.dataset_doc("c.csv", payload=None)), cat)
         for doc in docs:
             self.assertFalse({m.parsers.KIND_KEY, m.parsers.NAME_KEY, m.parsers.PAYLOAD_KEY} & set(doc.metadata))
-        self.assertNotIn("can be queried", docs[0].page_content)
-        self.assertIn("can be queried", docs[1].page_content)
+        # the datasets that could not be stored are not described in the memory (the notifier here cannot send errors)
+        self.assertEqual([d.page_content.splitlines()[0] for d in docs], ["Dataset 'b.csv'"])
+        self.assertIn("can be queried", docs[0].page_content)
 
 
 class EndpointsTest(unittest.TestCase):
-    def info(self, chat_id=None, permissions=None, agent=True, file_manager=None):
+    def info(self, chat_id=None, permissions=None, agent=True, file_manager=None, user_id="u1", key=None):
         from fastapi import UploadFile  # noqa: F401 - FastAPI is a dependency of the core
-        key = f"agent-{time.monotonic_ns()}"
+        key = key or f"agent-{time.monotonic_ns()}"
         plugin = SimpleNamespace(load_settings=mock.AsyncMock(return_value=support.default_settings(max_upload_size_mb=1)))
         cheshire_cat = SimpleNamespace(
             agent_key=key, mad_hatter=SimpleNamespace(get_plugin=lambda: plugin), file_manager=file_manager or m.file_manager,
@@ -174,7 +182,7 @@ class EndpointsTest(unittest.TestCase):
         return SimpleNamespace(
             cheshire_cat=cheshire_cat,
             stray_cat=SimpleNamespace(id=chat_id) if chat_id else None,
-            user=SimpleNamespace(permissions=permissions if permissions is not None else {"UPLOAD": ["WRITE"]}),
+            user=SimpleNamespace(id=user_id, permissions=permissions if permissions is not None else {"UPLOAD": ["WRITE"]}),
         )
 
     def upload(self, info, name="s.csv", content=b"a\n1\n", size=None):
@@ -210,6 +218,25 @@ class EndpointsTest(unittest.TestCase):
                      lambda i: support.run(m.endpoints.delete_dataset.function(name="x", info=i))):
             with self.assertRaises(m.endpoints.CustomValidationException):
                 call(self.info(agent=False))
+
+    def test_datasets_of_the_users_of_a_conversation(self):
+        # the chat id is chosen by the client: two users may use the same one, and never see each other's datasets
+        key = f"agent-{time.monotonic_ns()}"
+        self.upload(self.info(chat_id="c1", permissions={}, user_id="u1", key=key), name="mine.csv")
+        other = self.info(chat_id="c1", permissions={}, user_id="u2", key=key)
+        self.assertEqual(support.run(m.endpoints.list_datasets.function(info=other)).datasets, [])
+        with self.assertRaises(m.endpoints.CustomNotFoundException):
+            support.run(m.endpoints.delete_dataset.function(name="mine.csv", info=other))
+
+    def test_conversations_whose_id_is_not_a_folder_name(self):
+        for chat_id in ("a/b", "..", "."):
+            with self.subTest(chat_id=chat_id):
+                info = self.info(chat_id=chat_id, permissions={})
+                with self.assertRaises(m.endpoints.CustomValidationException):
+                    self.upload(info)
+                with self.assertRaises(m.endpoints.CustomValidationException):
+                    support.run(m.endpoints.delete_dataset.function(name="s.csv", info=info))
+                self.assertEqual(support.run(m.endpoints.list_datasets.function(info=info)).datasets, [])
 
     def test_settings_failure_uses_the_defaults(self):
         info = self.info(chat_id="c")

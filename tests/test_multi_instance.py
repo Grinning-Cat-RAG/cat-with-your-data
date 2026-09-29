@@ -33,8 +33,8 @@ class MultiInstanceTest(unittest.TestCase):
         self.agent = f"agent-{time.monotonic_ns()}"
         self.fm = self.file_manager()
 
-    def store(self, chat="chat"):
-        return m.datasets.DatasetStore(self.fm, self.agent, chat)
+    def store(self, chat="chat", user="user-1"):
+        return m.datasets.DatasetStore(self.fm, self.agent, chat, user)
 
     def agent_engine(self, chat="chat"):
         cat = m.fakes.make_cat(agent_key=self.agent, chat_id=chat, file_manager=self.fm)
@@ -116,7 +116,7 @@ class MultiInstanceTest(unittest.TestCase):
         with self.on_first("remove_file", "--old.csv", lambda: self.store("idle").add("new.csv", b"v\n2\n")):
             self.store("other").cleanup_expired(1)
         self.assertEqual([d.name for d in idle.list_datasets()], ["new.csv"])
-        self.assertIn("idle", [f.name for f in self.fm.list_files(idle.index_dir)], "the conversation is active")
+        self.assertIn("idle+user-1", [f.name for f in self.fm.list_files(idle.index_dir)], "the conversation is active")
 
     def test_cleanup_racing_a_question(self):
         # a question arrives (on another instance) while the conversation is expiring: it stays active from now on
@@ -125,7 +125,7 @@ class MultiInstanceTest(unittest.TestCase):
             idle.add("old.csv", b"v\n1\n")
         with self.on_first("remove_file", "--old.csv", self.store("idle").mark_used):
             self.store("other").cleanup_expired(1)
-        self.assertIn("idle", [f.name for f in self.fm.list_files(idle.index_dir)])
+        self.assertIn("idle+user-1", [f.name for f in self.fm.list_files(idle.index_dir)])
 
     def test_activity_being_recorded(self):
         # regression: a marker read while being written (in place) looked like a very old activity

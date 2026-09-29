@@ -1,10 +1,8 @@
 import asyncio
-import json
 import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any, List
 from urllib.parse import quote
 
@@ -15,17 +13,16 @@ from langchain_community.tools.json.tool import JsonSpec
 from langchain_community.agent_toolkits.sql.prompt import SQL_PREFIX
 from langchain_core.language_models import BaseChatModel
 from sqlalchemy.engine import Engine
-from cat import StrayCat, AgenticWorkflowTask, AgenticWorkflowOutput, CatMessage
+from cat import StrayCat, AgenticWorkflowTask, AgenticWorkflowOutput
 from cat.log import log
 from cat.templates import prompts
 
 from .chart_tool import WHEN_TO_USE, ChartCollector, ChartToolFactory
 from .charts import chart_markdown_inline, strip_inline_images
 from .data_engine import (
-    engine_from_bytes, engine_from_csv, engine_from_json, engine_from_uri, sql_database, validate_read_only,
+    engine_from_bytes, engine_from_csv, engine_from_json, engine_from_uri, read_json, sql_database, validate_read_only,
 )
-# the core loader imports and then reloads the plugin modules one by one, in no particular order: the classes of
-# `datasets` are looked up at call time, so that `except` and patches always see the current ones
+# sibling modules are looked up at call time
 from . import datasets
 from .settings import datasources
 
@@ -34,7 +31,7 @@ from .settings import datasources
 class DataSource:
     kind: str  # "sql" | "json"
     engine: Engine | None = None
-    json_path: str | None = None
+    json_data: Any = None
     label: str = ""
     # engines built for a single request (uploaded datasets) are disposed after it and their schema is not cached
     per_request: bool = False
@@ -70,7 +67,7 @@ class ReadOnlyQuerySQLDatabaseTool(QuerySQLDatabaseTool):
 
     def _run(self, query: str, run_manager=None) -> str:
         try:
-            query = validate_read_only(query)
+            query = validate_read_only(query, self.db._engine.dialect.name)
         except ValueError as e:
             return f"Error: {e} Write a single read-only SELECT statement."
         return super()._run(query, run_manager)
@@ -95,7 +92,8 @@ class QueryCatAgent:
     # Load configurations
     async def _load_configurations(self):
         # Acquire settings
-        settings = await self.cat.mad_hatter.get_plugin().load_settings()
+        # the agent is explicit: otherwise the core looks for it in the call stack, and finds the wrong one
+        settings = await self.cat.mad_hatter.get_plugin().load_settings(self.cat.agent_key)
 
         # If the settings are the same, skip the function
         if self.settings and self.settings == settings:
@@ -142,7 +140,7 @@ class QueryCatAgent:
     # datasource
     # ----------------------------------------------------------------------------------------------------------------
     def _uploaded_datasets_engine(self) -> Engine | None:
-        store = datasets.DatasetStore(self.cat.file_manager, self.cat.agent_key, self.cat.id)
+        store = datasets.DatasetStore(self.cat.file_manager, self.cat.agent_key, self.cat.id, self.cat.user.id)
         failures = 0
         while True:
             try:
@@ -184,19 +182,27 @@ class QueryCatAgent:
                 connection_string = datasources[datasource_type]["conn_str"].format(**params)
                 log.info(f"Connection string: {_mask_password(connection_string)}")
                 return DataSource(kind="sql", engine=engine_from_uri(connection_string), label=datasource_type)
+
+            # the file datasources are read from the file manager of the agent, never from the disk of the instance
+            file = await asyncio.to_thread(
+                datasets.configured_file, self.cat.file_manager, self.cat.agent_key, self.settings.get("host")
+            )
+            if agent_type == "sqlite":
+                engine = await asyncio.to_thread(engine_from_bytes, await asyncio.to_thread(file.load))
+                return DataSource(kind="sql", engine=engine, label=file.name, per_request=True)
             if agent_type == "csv":
-                engine = await asyncio.to_thread(engine_from_csv, self.settings["host"])
-                return DataSource(kind="sql", engine=engine, label=Path(self.settings["host"]).name)
+                engine = await asyncio.to_thread(engine_from_csv, file)
+                return DataSource(kind="sql", engine=engine, label=file.name)
             # agent_type == "json": tabular JSON files are queried with SQL (and can be charted), the others with the
             # JSON agent
             try:
-                engine = await asyncio.to_thread(engine_from_json, self.settings["host"])
+                engine = await asyncio.to_thread(engine_from_json, file)
             except Exception as e:
                 log.warning(f"[cat-with-your-data] the JSON file cannot be loaded as tables: {e}")
                 engine = None
             if engine is not None:
                 return DataSource(kind="sql", engine=engine, label="JSON")
-            return DataSource(kind="json", json_path=self.settings["host"], label="JSON")
+            return DataSource(kind="json", json_data=await asyncio.to_thread(read_json, file), label="JSON")
         except Exception as e:
             log.error(f"Failed to create the connection to the datasource: {e}")
         return None
@@ -213,7 +219,7 @@ class QueryCatAgent:
             return None
 
         if source.kind == "json":
-            thought = await self._get_reasoning_json_agent(source.json_path)
+            thought = await self._get_reasoning_json_agent(source.json_data)
             return QueryResult(thought=thought, answer=thought) if thought else None
 
         collector = ChartCollector()
@@ -293,19 +299,6 @@ reply to the user briefly, precisely and based on the context of the dialogue.
             callbacks=await self._llm_callbacks(),
         )
 
-    async def save_answer_in_history(self, text: str) -> None:
-        """The fast reply skips the core hook saving the answer: save it, so that follow-up questions have context.
-
-        The inline charts are replaced by a short placeholder: the core sends the latest messages of the history to the
-        LLM, and a base64 image is tens of thousands of tokens of noise.
-        """
-        try:
-            await self.cat.working_memory.update_history(
-                who="assistant", content=CatMessage(text=strip_inline_images(text))
-            )
-        except Exception as e:
-            log.warning(f"[cat-with-your-data] cannot save the answer in the conversation history: {e}")
-
     # ----------------------------------------------------------------------------------------------------------------
     # reasoning agents
     # ----------------------------------------------------------------------------------------------------------------
@@ -378,12 +371,9 @@ reply to the user briefly, precisely and based on the context of the dialogue.
         return await self._execute(agent_executor)
 
     # Execute json agent
-    async def _get_reasoning_json_agent(self, json_file_path: str) -> str | None:
+    async def _get_reasoning_json_agent(self, data: Any) -> str | None:
         # Create JSON agent
         try:
-            # Get json data
-            data = json.loads(Path(json_file_path).read_text(encoding="utf-8"))
-
             # Create JSON toolkit
             json_spec = JsonSpec(dict_=data, max_value_length=4000)
             json_toolkit = JsonToolkit(spec=json_spec)

@@ -30,9 +30,9 @@ datasources = {
         "agent_type": "sql",
         "conn_str": "mssql+pyodbc://{username}:{password}@{database}"
     },
+    # the file datasources are files in the file manager of the agent (``host``: their path in the folder of the agent)
     "SQLite": {
-        "agent_type": "sql",
-        "conn_str": "sqlite:///{host}"
+        "agent_type": "sqlite"
     },
     "CSV": {
         "agent_type": "csv"
@@ -67,6 +67,8 @@ class MySettings(BaseModel):
     )
     host: str = Field(
         title="host or file path",
+        description="SQL databases: the host. CSV, JSON and SQLite: the path of the file in the file manager of the "
+                    "agent, relative to the folder of the agent (e.g. sales.csv, a file uploaded in its memory)",
         default=""
     )
     port: int = Field(

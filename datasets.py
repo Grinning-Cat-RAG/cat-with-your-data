@@ -4,10 +4,19 @@ The datasets are stored with the file manager configured for the agent (local fo
 the core uses for the uploaded files; the plugin never writes on the local disk of the instance (pod). Paths, relative
 to the root of the file manager:
 
-- ``<agent>/<chat>/cat_with_your_data/``: the datasets of a conversation (removed with the conversation);
-- ``<agent>/cat_with_your_data/``: the datasets shared by every conversation of the agent (removed with the agent);
-- ``<agent>/cat_with_your_data/_chats/<chat>``: the last activity of every conversation with datasets, used to remove
-  the datasets of the idle conversations.
+- ``<agent>/<chat>/cat_with_your_data/<user>/``: the datasets of a user in a conversation. ``<agent>/<chat>`` is the
+  folder of the conversation, as the core names it: the core removes it (and so the datasets) with the conversation.
+  The chat id is chosen by the client, so two users may use the same one: every user has its own datasets. A
+  conversation whose id cannot be a folder name (``/`` or ``\\`` inside, ``.``, ``..``) has no datasets of its own;
+- ``system/cat_with_your_data/<agent>/``: the datasets shared by every conversation of the agent, removed when the
+  agent is destroyed. They are outside the folder of the agent, where every folder may be the one of a conversation
+  (the chat ids are chosen by the clients): removing a conversation never removes them. ``system`` is the id of the
+  system agent, never the one of another agent;
+- ``system/cat_with_your_data/<agent>/_chats/<chat>+<user>``: the last activity of every user with datasets in a
+  conversation, used to remove the datasets of the idle conversations.
+
+``<user>`` and the ids in the names of the ``system`` folder are URL-encoded (and ``.`` too): they never contain a
+separator of the path, nor are ``.`` or ``..``, and two different ids never have the same name.
 
 The file managers offer neither renames nor locks, and they may be shared by several instances of the Cat, so the
 stored files are immutable objects: every upload is written under a new name, ``<timestamp>-<checksum>--<name>``, the
@@ -32,21 +41,25 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
+from urllib.parse import quote, unquote
 
 import pandas as pd
 
 from cat import log
+from cat.db.database import DEFAULT_SYSTEM_KEY
 
 PLUGIN_DATA_DIR = "cat_with_your_data"
 CHATS_INDEX = "_chats"
+#: the folder of the system agent: no other agent has this id (the core refuses it)
+SYSTEM_DIR = DEFAULT_SYSTEM_KEY
 
 CSV_EXTENSIONS = {".csv", ".tsv"}
 SQLITE_EXTENSIONS = {".sqlite", ".sqlite3", ".db", ".db3"}
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
-_SAFE_ID = re.compile(r"^[A-Za-z0-9_\-.]{1,128}$")
 _MARKER_WIDTH = 20  # last activity of a conversation: seconds, e.g. 0001790000000.123456
+_MARKER_SEPARATOR = "+"  # never in an encoded id
 _STORED_NAME = re.compile(r"^(\d{20})-([0-9a-f]{16})--(.+)$")
 
 #: workspaces cached by this instance (stored names -> serialized SQLite database), at most this many bytes
@@ -62,6 +75,10 @@ class DatasetError(Exception):
 class _IncompleteCopy(Exception):
     """A stored file whose content does not match its checksum: being written, or its upload was interrupted."""
 
+    def __init__(self, path: str, length: int):
+        super().__init__(path)
+        self.length = length
+
 
 @dataclass
 class DatasetInfo:
@@ -76,12 +93,62 @@ class DatasetInfo:
         return asdict(self)
 
 
-def _safe_segment(value: str) -> str:
-    """Return a string that can be safely used as a folder name (no path traversal)."""
-    value = str(value or "")
-    if _SAFE_ID.match(value) and value not in {".", ".."}:
-        return value
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+def encoded(value: str | None) -> str:
+    """The id as a folder or file name: URL-encoded, dots included (never a separator, ``.`` or ``..``)."""
+    return quote(str(value if value is not None else ""), safe="").replace(".", "%2E")
+
+
+def decoded(value: str) -> str:
+    return unquote(value)
+
+
+def is_folder_name(value: str | None) -> bool:
+    """Whether the id, as the core uses it in the paths (``<agent>/<chat>``), is a single folder of the file manager."""
+    return bool(value) and "/" not in value and "\\" not in value and value not in (".", "..")
+
+
+def shared_dir_of(agent_key: str) -> str:
+    """The folder of the datasets shared by every conversation of the agent (and of its index)."""
+    return f"{SYSTEM_DIR}/{PLUGIN_DATA_DIR}/{encoded(agent_key)}"
+
+
+@dataclass
+class ConfiguredFile:
+    """A file datasource of the settings (CSV, JSON, SQLite), in the file manager of the agent."""
+    name: str
+    #: identifies the content: the same version, the same content
+    version: str
+    load: Callable[[], bytes]
+
+
+def configured_file(file_manager, agent_key: str, path: str) -> ConfiguredFile:
+    """The file of a configured datasource: ``path`` is relative to the folder of the agent in its file manager (e.g.
+    ``sales.csv``, a file uploaded in the memory of the agent). DatasetError if the path is not valid or the file is
+    missing.
+    """
+    parts = str(path or "").strip().split("/")
+    if not is_folder_name(agent_key) or not all(is_folder_name(part) for part in parts):
+        raise DatasetError(
+            f"'{path}' is not a path in the file manager of the agent: use the path of the file relative to the folder "
+            "of the agent (e.g. sales.csv), without '..', '\\' or a leading '/'."
+        )
+    folder = "/".join([agent_key, *parts[:-1]])
+    name = parts[-1]
+    full_path = f"{folder}/{name}"
+    listed = next((item for item in file_manager.list_files(folder) if item.name == name), None)
+    if listed is None:
+        raise DatasetError(f"The file '{path}' is not in the file manager of the agent.")
+
+    def download() -> bytes:
+        if (content := file_manager.download_file(full_path)) is None:
+            raise DatasetError(f"The file '{path}' cannot be read from the file manager of the agent.")
+        return content
+
+    if listed.hash:
+        return ConfiguredFile(name, f"{full_path}::{listed.size}::{listed.hash}", download)
+    # the file manager does not give a hash: the content is downloaded to identify it
+    content = download()
+    return ConfiguredFile(name, f"{full_path}::{hashlib.sha256(content).hexdigest()}", lambda: content)
 
 
 def sanitize_filename(filename: str) -> str:
@@ -330,23 +397,37 @@ def _cached_workspace(key: Tuple[str, ...]) -> bytes | None:
 # Store
 # --------------------------------------------------------------------------------------------------------------------
 class DatasetStore:
-    """Datasets visible in a conversation (chat scope) or in the whole agent (shared scope), in a file manager."""
+    """Datasets visible to a user in a conversation (chat scope) or in the whole agent (shared scope), in a file manager.
 
-    def __init__(self, file_manager, agent_key: str, chat_id: str | None = None):
+    Without a conversation, only the shared datasets are visible.
+    """
+
+    def __init__(self, file_manager, agent_key: str, chat_id: str | None = None, user_id: str | None = None):
         self.file_manager = file_manager
         self.agent_key = agent_key
         self.chat_id = chat_id
-        agent = _safe_segment(agent_key)
-        self.shared_dir = f"{agent}/{PLUGIN_DATA_DIR}"
+        self.user_id = user_id
+        self.shared_dir = shared_dir_of(agent_key)
         self.index_dir = f"{self.shared_dir}/{CHATS_INDEX}"
-        self.chat_segment = _safe_segment(chat_id) if chat_id else None
-        # the folder of the conversation is the one of the core: the datasets are removed with the conversation
-        self.chat_dir = f"{agent}/{self.chat_segment}/{PLUGIN_DATA_DIR}" if chat_id else None
+        self.chat_dir = self.marker = None
+        if chat_id and user_id and is_folder_name(chat_id) and is_folder_name(agent_key):
+            # the folder of the conversation is the one of the core: the datasets are removed with the conversation
+            self.chat_dir = self._chat_dir(chat_id, user_id)
+            self.marker = f"{encoded(chat_id)}{_MARKER_SEPARATOR}{encoded(user_id)}"
+        self._sizes: Dict[str, int] = {}  # listed size of the stored files: it changes while a copy is being written
+
+    def _chat_dir(self, chat_id: str, user_id: str | None) -> str:
+        return f"{self.agent_key}/{chat_id}/{PLUGIN_DATA_DIR}/{encoded(user_id)}"
 
     # ---------------------------------------------------------------------------------------------------------------
     def _scope_dir(self, shared: bool) -> str:
-        if shared or self.chat_dir is None:
+        if shared or not self.chat_id:
             return self.shared_dir
+        if self.chat_dir is None:
+            raise DatasetError(
+                "The datasets cannot be stored in this conversation: its id (or the one of the agent) cannot be a "
+                "folder name (it contains '/' or '\\', or it is '.' or '..')."
+            )
         return self.chat_dir
 
     def _stored_files(self, folder: str) -> Dict[str, List[str]]:
@@ -355,6 +436,7 @@ class DatasetStore:
         for item in sorted(self.file_manager.list_files(folder), key=lambda f: f.name):
             if match := _STORED_NAME.match(item.name):
                 files.setdefault(match.group(3), []).append(item.name)
+                self._sizes[f"{folder}/{item.name}"] = item.size
         return files
 
     def _visible_files(self) -> List[Tuple[str, List[Tuple[str, str]]]]:
@@ -379,25 +461,26 @@ class DatasetStore:
         if content is None:
             raise FileNotFoundError(f"{path} was removed")
         if _checksum(content) != _STORED_NAME.match(Path(path).name).group(2):
-            raise _IncompleteCopy(path)
+            raise _IncompleteCopy(path, len(content))
         return content
 
     def _content(self, copies: List[Tuple[str, str]]) -> Tuple[Tuple[str, str, bytes] | None, bool]:
-        """(scope, path, content) of the most preferred complete copy (None if there is none), and whether a more
-        preferred copy was skipped because incomplete: an upload still running (on any instance) is not visible yet,
-        and an interrupted one never is.
+        """(scope, path, content) of the most preferred complete copy (None if there is none), and whether the result
+        can be cached. An upload still running (on any instance) is not visible yet, and an interrupted one never is.
 
+        A skipped copy as long as listed is really incomplete: its size, part of the cache key, changes when it is
+        written further. A copy shorter than listed was read partially: the result is not cached.
         FileNotFoundError if a copy was removed meanwhile (replaced on another instance: the listing is stale): the
         caller can retry.
         """
-        skipped = False
+        cacheable = True
         for scope, path in reversed(copies):
             try:
-                return (scope, path, self._download(path)), skipped
-            except _IncompleteCopy:
+                return (scope, path, self._download(path)), cacheable
+            except _IncompleteCopy as incomplete:
                 log.debug(f"[cat-with-your-data] {path} is incomplete (being written, or interrupted): ignored")
-                skipped = True
-        return None, skipped
+                cacheable = cacheable and incomplete.length == self._sizes.get(path)
+        return None, cacheable
 
     def _new_stored_name(self, folder: str, name: str, content: bytes) -> str:
         # later than every existing copy: the order of the uploads does not depend on the clocks of the instances
@@ -427,11 +510,11 @@ class DatasetStore:
             if not tables:
                 raise DatasetError("The SQLite file does not contain any table.")
 
+        folder = self._scope_dir(shared)
         # the activity is recorded first: if this instance dies in the middle of the write, the incomplete copy is
         # removed with the idle conversation
-        if not shared:
+        if folder != self.shared_dir:
             self.mark_used()
-        folder = self._scope_dir(shared)
         stored = self._new_stored_name(folder, name, content)
         if not self.file_manager.write_file(content, stored, folder):
             raise DatasetError("The dataset cannot be stored: see the log of the Cat.")
@@ -452,7 +535,7 @@ class DatasetStore:
         return DatasetInfo(
             name=name,
             kind=kind,
-            scope="shared" if (shared or self.chat_dir is None) else "chat",
+            scope="shared" if folder == self.shared_dir else "chat",
             size=len(content),
             uploaded_at=int(stored[:20]) / 1e9,
             tables=tables,
@@ -485,10 +568,10 @@ class DatasetStore:
         return result
 
     def mark_used(self) -> None:
-        """Record the last activity of the conversation: its datasets expire when idle for a while."""
-        if self.chat_segment is not None:
+        """Record the last activity of the user in the conversation: its datasets expire when idle for a while."""
+        if self.marker is not None:
             # fixed width: a marker read while being written (in place) is recognized by its length
-            self.file_manager.write_file(f"{time.time():0{_MARKER_WIDTH}.6f}", self.chat_segment, self.index_dir)
+            self.file_manager.write_file(f"{time.time():0{_MARKER_WIDTH}.6f}", self.marker, self.index_dir)
 
     # ---------------------------------------------------------------------------------------------------------------
     def workspace(self) -> bytes | None:
@@ -500,15 +583,16 @@ class DatasetStore:
         if not files:
             return None
 
-        # stored files are immutable: their names identify the content
-        key = tuple(path for _, copies in files for _, path in copies)
+        # stored files are immutable once complete: their names identify the content, and their sizes tell a copy still
+        # being written (skipped until complete) from the complete one
+        key = tuple((path, self._sizes.get(path)) for _, copies in files for _, path in copies)
         if (cached := _cached_workspace(key)) is not None:
             return cached
 
-        contents, incomplete = [], False
+        contents, cacheable = [], True
         for name, copies in files:
-            found, skipped = self._content(copies)
-            incomplete = incomplete or skipped
+            found, reliable = self._content(copies)
+            cacheable = cacheable and reliable
             if found is not None:
                 contents.append((name, found[2]))
         if not contents:
@@ -517,8 +601,7 @@ class DatasetStore:
             workspace = contents[0][1]  # a single SQLite file: used as it is
         else:
             workspace = build_workspace(contents)
-        # without the copies being written: it would become stale as soon as they are complete
-        if not incomplete:
+        if cacheable:
             _cache_workspace(key, workspace)
         return workspace
 
@@ -534,26 +617,28 @@ class DatasetStore:
             return
 
         threshold = time.time() - ttl_hours * 3600
-        for marker in self.file_manager.list_files(self.index_dir):
-            chat_segment = marker.name
-            if chat_segment == self.chat_segment:
+        for item in self.file_manager.list_files(self.index_dir):
+            marker = item.name
+            if marker == self.marker:
                 continue
             try:
-                if self._last_activity(chat_segment) >= threshold:
+                if self._last_activity(marker) >= threshold:
                     continue
-                folder = f"{_safe_segment(self.agent_key)}/{chat_segment}/{PLUGIN_DATA_DIR}"
-                for copies in self._stored_files(folder).values():
-                    for stored in copies:
-                        if int(stored[:20]) / 1e9 < threshold:
-                            self.file_manager.remove_file(f"{folder}/{stored}")
+                chat_id, separator, user_id = marker.partition(_MARKER_SEPARATOR)
+                if separator and is_folder_name(decoded(chat_id)):
+                    folder = self._chat_dir(decoded(chat_id), decoded(user_id))
+                    for copies in self._stored_files(folder).values():
+                        for stored in copies:
+                            if int(stored[:20]) / 1e9 < threshold:
+                                self.file_manager.remove_file(f"{folder}/{stored}")
                 # used again meanwhile (on another instance): the marker stays
-                if self._last_activity(chat_segment) < threshold:
-                    self.file_manager.remove_file(f"{self.index_dir}/{chat_segment}")
+                if self._last_activity(marker) < threshold:
+                    self.file_manager.remove_file(f"{self.index_dir}/{marker}")
             except Exception as e:  # noqa: BLE001 - the cleanup of a conversation never stops the others
-                log.warning(f"[cat-with-your-data] cleanup of the conversation {chat_segment} failed: {e}")
+                log.warning(f"[cat-with-your-data] cleanup of the conversation {marker} failed: {e}")
 
-    def _last_activity(self, chat_segment: str) -> float:
-        content = self.file_manager.download_file(f"{self.index_dir}/{chat_segment}")
+    def _last_activity(self, marker: str) -> float:
+        content = self.file_manager.download_file(f"{self.index_dir}/{marker}")
         if content is None:
             return float("inf")  # removed meanwhile: nothing to do
         text = content.decode("utf-8", errors="replace")

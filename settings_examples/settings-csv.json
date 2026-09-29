@@ -1,5 +1,5 @@
 {
-    "host": "/app/cat/plugins/query-cat/data_examples/products.csv",
+    "host": "products.csv",
     "port": "",
     "username": "",
     "password": "",

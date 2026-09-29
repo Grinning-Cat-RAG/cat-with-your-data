@@ -1,6 +1,5 @@
 """Engines on the datasources and read-only queries."""
 import json
-import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -18,12 +17,10 @@ def setUpModule():
 
 class Files(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = support.temporary_folder(self)
 
-    def csv(self, text="region,amount\nN,1\nS,2\n", name="sales.csv") -> Path:
-        path = self.tmp / name
-        path.write_text(text)
-        return path
+    def csv(self, text="region,amount\nN,1\nS,2\n", name="sales.csv"):
+        return support.configured_file(name, text.encode())
 
     def secret_db(self) -> Path:
         return support.sqlite_file(self.tmp / "secret.db", {"s": (["x"], [("SECRET",)])})
@@ -41,8 +38,8 @@ class SqliteHardeningTest(Files):
         self.assert_no_attach(m.data_engine.engine_from_bytes(support.sqlite_bytes({"t": (["v"], [(1,)])})))
 
     def test_configured_sqlite_is_read_only(self):
-        path = support.sqlite_file(self.tmp / "conf.sqlite", {"t": (["v"], [(1,)])})
-        engine = m.data_engine.engine_from_uri(f"sqlite:///{path}")
+        # the configured SQLite files are read from the file manager, as the uploaded datasets
+        engine = m.data_engine.engine_from_bytes(support.sqlite_bytes({"t": (["v"], [(1,)])}))
         self.assert_no_attach(engine)
         db = m.data_engine.sql_database(engine, cache=False)
         self.assertIn("Error", db.run_no_throw("CREATE TABLE w (x)"))
@@ -50,7 +47,7 @@ class SqliteHardeningTest(Files):
 
     def test_csv_engine_cannot_attach_nor_write(self):
         # regression: DROP TABLE on the cached in-memory engine persisted until the CSV file changed
-        engine = m.data_engine.engine_from_csv(str(self.csv()))
+        engine = m.data_engine.engine_from_csv(self.csv())
         self.assert_no_attach(engine)
         db = m.data_engine.sql_database(engine, cache=False)
         self.assertIn("Error", db.run_no_throw("DROP TABLE sales"))
@@ -89,7 +86,7 @@ class ReadOnlySessionsTest(Files):
 class ConcurrencyTest(Files):
     def test_in_memory_engine_under_concurrent_queries(self):
         # regression: the single connection shared by all the threads (StaticPool) returned wrong results
-        engine = m.data_engine.engine_from_csv(str(self.csv("n\n" + "\n".join(str(i) for i in range(200)) + "\n")))
+        engine = m.data_engine.engine_from_csv(self.csv("n\n" + "\n".join(str(i) for i in range(200)) + "\n"))
         errors = []
 
         def worker():
@@ -111,11 +108,9 @@ class ConcurrencyTest(Files):
 
 class CacheTest(Files):
     def test_csv_engine_is_cached_until_the_file_changes(self):
-        path = self.csv()
-        first = m.data_engine.engine_from_csv(str(path))
-        self.assertIs(m.data_engine.engine_from_csv(str(path)), first)
-        path.write_text("region,amount\nN,1\nS,2\nE,3\n")
-        second = m.data_engine.engine_from_csv(str(path))
+        first = m.data_engine.engine_from_csv(self.csv())
+        self.assertIs(m.data_engine.engine_from_csv(self.csv()), first)
+        second = m.data_engine.engine_from_csv(self.csv("region,amount\nN,1\nS,2\nE,3\n"))
         self.assertIsNot(second, first)
         self.assertEqual(m.data_engine.sql_database(second, cache=False).run("SELECT COUNT(*) FROM sales"), "[(3,)]")
 
@@ -156,7 +151,7 @@ class CacheTest(Files):
         self.assertEqual(postgres.dialect.name, "postgresql")
 
     def test_schema_cache(self):
-        engine = m.data_engine.engine_from_csv(str(self.csv()))
+        engine = m.data_engine.engine_from_csv(self.csv())
         db = m.data_engine.sql_database(engine)
         self.assertIs(m.data_engine.sql_database(engine), db)
         self.assertIsNot(m.data_engine.sql_database(engine, cache=False), db)
@@ -165,10 +160,8 @@ class CacheTest(Files):
 
 
 class JsonTest(Files):
-    def write(self, data) -> str:
-        path = self.tmp / f"d{id(data)}.json"
-        path.write_text(json.dumps(data))
-        return str(path)
+    def write(self, data):
+        return support.configured_file("d.json", json.dumps(data).encode())
 
     def test_json_to_frames(self):
         frames = m.data_engine.json_to_frames
@@ -200,8 +193,17 @@ class ReadOnlyQueryTest(Files):
             with self.subTest(sql=invalid), self.assertRaises(ValueError):
                 valid(invalid)
 
+    def test_statements_read_by_the_parser(self):
+        check = m.data_engine._check_statement
+        for sql, dialect in (("SELECT (", "postgresql"), ("SELECT 1; SELECT 2", None), ("INSERT INTO t VALUES (1)", None),
+                             ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "postgresql"),
+                             ("SELECT * FROM t FOR UPDATE", "mysql"), ("SELECT sys.dbms_lock.sleep(5) FROM dual", "oracle")):
+            with self.subTest(sql=sql), self.assertRaises(ValueError):
+                check(sql, dialect)
+        check("SELECT a FROM t", "unknown-database")  # an unknown database: the generic dialect
+
     def test_run_select_truncates(self):
-        engine = m.data_engine.engine_from_csv(str(self.csv()))
+        engine = m.data_engine.engine_from_csv(self.csv())
         df, truncated = m.data_engine.run_select(engine, "SELECT * FROM sales", 1)
         self.assertEqual((len(df), truncated), (1, True))
         df, truncated = m.data_engine.run_select(engine, "SELECT * FROM sales", 5)
@@ -209,7 +211,7 @@ class ReadOnlyQueryTest(Files):
 
     def test_run_select_passes_no_parameters_to_the_driver(self):
         # regression: with parameters (even empty), pyformat drivers (psycopg2...) read "%" as a placeholder
-        engine = m.data_engine.engine_from_csv(str(self.csv("n\nA%\nB\n")))
+        engine = m.data_engine.engine_from_csv(self.csv("n\nA%\nB\n"))
         with mock.patch.object(engine.dialect, "do_execute", side_effect=AssertionError("parameters passed")):
             df, _ = m.data_engine.run_select(engine, "SELECT n FROM sales WHERE n LIKE 'A%'", 10)
         self.assertEqual(df["n"].tolist(), ["A%"])
