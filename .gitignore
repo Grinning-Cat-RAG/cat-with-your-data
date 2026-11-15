@@ -158,3 +158,8 @@ settings.json
 uv.lock
 .requirements_hash
 .install.lock
+
+# local agent tooling
+.opencode
+.omo
+AGENTS.md
